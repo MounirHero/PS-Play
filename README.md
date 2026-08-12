@@ -31,14 +31,13 @@ PS Play is based on the open-source **[Prospero Player 1.0](https://github.com/K
 
 ## Requirements
 
-- PlayStation 5 on firmware **4.00** (other umtx-compatible firmwares may work)
-- An active jailbreak (umtx) and a payload sender (port 9021)
+- An active jailbreak and a payload sender (port 9021)
 - Like all homebrew on this firmware, **the ELF must be injected again after each reboot**
 
 ## Installation
 
 1. Jailbreak your PS5 and start the payload listener.
-2. Inject **`PSPlay-1.5-MediaLauncher.elf`** (the installer).
+2. Inject **`PSPlay-1.5.elf`** (the installer).
 3. Watch the notifications: `step 3 ok` → `step 4 ok` → `step 6 ok` → `PS Play 1.5 ready — Open from Media`.
 4. Open **PS Play** from the Media section of the home screen.
 
