@@ -1,0 +1,44 @@
+PS Play 1.5
+Copyright (C) 2026 InsideMatrixDev / MounirHero
+
+Based on ProsperoPlayer 1.0 by KINGDKAK (GPL-3.0)
+Upstream: https://github.com/KINGDKAK/ProsperoPlayer
+Copyright (C) 2025–2026 ProsperoPlayer contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+See the file LICENSE for the full text of the GNU General Public License.
+
+------------------------------------------------------------------------------
+Third-party / derived components
+------------------------------------------------------------------------------
+
+1) ps5-payload-websrv BigApp loader (GPL-3.0-or-later)
+   Author: John Törnblom
+   Used in: prospero_media_standalone/core/ (hbldr, elfldr, pt)
+   Upstream: https://github.com/ps5-payload-dev/websrv
+   (and related ps5-payload projects)
+
+   These modules implement the system BigApp host prepare + ELF replace
+   path. They remain under GPL-3.0-or-later. ProsperoPlayer packaging
+   adapted them for Prospero title IDs and the Prospero media launcher.
+
+2) FFmpeg libraries (linked via PS5 homebrew SDK builds)
+   Used for demux/decode/resample/scale in the player.
+   FFmpeg is typically LGPL/GPL depending on how it was configured.
+   Your SDK’s libav* binaries determine the exact FFmpeg license terms;
+   check your SDK / FFmpeg build documentation when redistributing.
+
+3) Sony PlayStation 5 system libraries (Sce*)
+   Proprietary. Linked only as system APIs on a jailbroken console.
+   Not redistributed as source in this repository.
+
+------------------------------------------------------------------------------
+Trademarks
+------------------------------------------------------------------------------
+
+PlayStation and PS5 are trademarks of Sony Interactive Entertainment Inc.
+This project is not affiliated with or endorsed by Sony.

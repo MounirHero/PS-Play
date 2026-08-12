@@ -1,0 +1,14 @@
+{
+  "applicationCategoryType": 65536,
+  "attribute": 536870913,
+  "attribute2": 0,
+  "attribute3": 4,
+  "titleId": "PRSP10001",
+  "deeplinkUri": "http://127.0.0.1:9055/launch",
+  "localizedParameters": {
+    "defaultLanguage": "en-US",
+    "en-US": {
+      "titleName": "PS Play"
+    }
+  }
+}

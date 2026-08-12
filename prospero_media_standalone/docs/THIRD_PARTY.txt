@@ -1,0 +1,12 @@
+ProsperoPlayer 1.0 — third-party notes (media launcher)
+
+This tree is part of ProsperoPlayer, licensed under GPL-3.0-or-later.
+See the repository root LICENSE and NOTICE.
+
+Loader modules under core/ (hbldr, elfldr, pt) are derived from
+John Törnblom's ps5-payload-websrv BigApp launch path (GPL-3.0-or-later).
+See docs/GPL-3.0.txt (same license text as root LICENSE).
+
+ProsperoPlayer title IDs (PRSP10001), ports, paths, branding, and
+launcher orchestration are original to this project and are also
+released under GPL-3.0-or-later with the rest of ProsperoPlayer.

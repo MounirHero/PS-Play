@@ -1,0 +1,17 @@
+# Build artifacts
+*.elf
+*.o
+*.a
+
+# Generated assets / debug output
+assets/gen/
+debug/
+
+# OS / editor noise
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Local toolchain env
+env.sh
