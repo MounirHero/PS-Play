@@ -1,4 +1,4 @@
-# PS Play
+# PS Play 2.1
 
 **All-in-one media hub for jailbroken PlayStation 5** — DLNA receiver, DLNA/UPnP browser, native Stremio client, IPTV/Live TV and USB playback in a single native app with a minimal AMOLED-black UI.
 
@@ -70,10 +70,8 @@ CIRCLE on the main menu asks for exit confirmation (X quits, O cancels).
 
 1. Jailbreak your PS5 and start the payload listener.
 2. Inject **`PSPlay.elf`** (the installer).
-3. Watch the notifications: `step 3 ok` → `step 4 ok` → `step 6 ok` → `PS Play ready — Open from Media`.
+3. Watch the notifications: PS Play ready.
 4. Open **PS Play** from the Media section of the home screen.
-
-> `PSPlay.elf` is the standalone player (useful for quick tests) — it does **not** install the home-screen tile. Use the MediaLauncher for installation.
 
 ---
 
