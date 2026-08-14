@@ -25,7 +25,7 @@
 
 ### Playback engineering
 - **FFmpeg-powered** — H.264, HEVC, AV1, VP9, MPEG-2/4, AAC, AC3, E-AC3, DTS, TrueHD, ALAC, FLAC, Opus, Vorbis, WMA, PCM. Protocols: HTTP/S, HLS, RTSP, RTP, UDP, RTMP, MMSH.
-- **Network anti-freeze** — 8 MB socket buffer, 384-packet demux queues, PTS discontinuity re-anchoring (HLS restarts / source switches), auto-resync on >3s desync, deadlock prevention (stalled audio dropped to keep video flowing), 1.5s post-underrun buffer, auto-reconnect on 4xx/5xx.
+- **Network anti-freeze** — 8 MB socket buffer, 384-packet demux queues, PTS discontinuity re-anchoring (HLS restarts / source switches), auto-resync on >3s desync, deadlock prevention (stalled audio dropped to keep video flowing), 1.5s post-underrun buffer, auto-reconnect on 4xx/5xx errors.
 - **Fast seeking** — 16 MB short-seek cache serves ±10s seeks from RAM without reopening the stream. Decoder threads park before touching codec state; the last frame stays visible instead of flashing black.
 - **Subtitles & audio** — external SRT, embedded tracks, per-track selection, ±100ms delay nudging. Multiple audio tracks, aspect ratio (Fit / Fill / Stretch), media info panel, optional stats overlay.
 - **Software volume** — 0-150%, also driven by DLNA SetVolume.
@@ -63,7 +63,7 @@ CIRCLE on the main menu asks for exit confirmation (X quits, O cancels).
 
 - An active jailbreak and a payload sender (port 9021)
 - Like all homebrew on this firmware, **the ELF must be injected again after each reboot**
-
+- It's not yet clear if there is PS5 firmwares that are not compatible, needs testing and report.
 ---
 
 ## Installation
