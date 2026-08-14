@@ -38,7 +38,7 @@
 #include "core/hbldr.h"
 #include "core/standalone_fs.h"
 
-#define PP_VERSION "1.5"
+#define PP_VERSION "2.1"
 #define PP_TITLE_ID "PRSP10001"
 #define PP_SERVICE_PORT 9055
 #define PP_APPINST_AUTHID UINT64_C(0x4801000000000013)
@@ -193,11 +193,9 @@ static void pp_notify(const char *msg) {
 /* Autoload often runs before the shell is ready — delay + second toast. */
 static void pp_notify_ready(void) {
   char line[96];
-  snprintf(line, sizeof(line), "PS Play %s ready\nOpen from Media",
-           PP_VERSION);
+  snprintf(line, sizeof(line), "PS Play %s READY", PP_VERSION);
   pp_notify(line);
   usleep(1500000);
-  snprintf(line, sizeof(line), "PS Play %s ready in Media", PP_VERSION);
   pp_notify(line);
 }
 
@@ -653,7 +651,6 @@ int main(void) {
   (void)signal(SIGPIPE, SIG_IGN);
   pp_log("ProsperoPlayer %s media launcher start id=%s port=%d", PP_VERSION,
          PP_TITLE_ID, PP_SERVICE_PORT);
-  pp_notify("PS Play " PP_VERSION " launcher\nstarting...");
 
   if (pp_player_elf_size < 64 || pp_player_elf[0] != 0x7f) {
     pp_log("embedded player invalid");
@@ -664,7 +661,6 @@ int main(void) {
     pp_notify("PS Play FAILED step 3\nruntime install (errno in log)");
     return 3;
   }
-  pp_notify("PS Play step 3 ok\nruntime installed");
 
   (void)sceUserServiceInitialize(NULL);
 
@@ -679,7 +675,6 @@ int main(void) {
     return 4;
   }
   pp_log("system host ready /system_ex/app/%s", PP_TITLE_ID);
-  pp_notify("PS Play step 4 ok\nsystem host ready");
 
   if (pp_with_appinst_authid(pp_register_media_tile) != 0) {
     pp_log("media tile registration failed");
@@ -687,7 +682,6 @@ int main(void) {
     (void)sceUserServiceTerminate();
     return 6;
   }
-  pp_notify("PS Play step 6 ok\nMedia tile registered");
 
   listen_fd = pp_bind_loopback();
   if (listen_fd < 0) {

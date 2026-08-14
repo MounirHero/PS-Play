@@ -15,6 +15,8 @@
 #ifndef PP_DMR_H
 #define PP_DMR_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -67,6 +69,12 @@ void pp_dmr_stop(void);
 
 /* Fetch next pending command (1 = got one, 0 = none). */
 int pp_dmr_take_command(pp_dmr_cmd *out);
+
+/*
+ * Fetch a pending device-connect event (controller IP that subscribed
+ * to GENA events for the first time). 1 = event copied to out.
+ */
+int pp_dmr_take_device_event(char *out, size_t outsz);
 
 /* Playback state feedback from the player (drives SOAP + LastChange). */
 void pp_dmr_report_playing(void);

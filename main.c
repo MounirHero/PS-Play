@@ -14,10 +14,12 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <libavformat/avformat.h>
+#include <libavformat/avio.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 #include <libavutil/avutil.h>
+#include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/opt.h>
 #include "pp_videoout.h"
@@ -33,6 +35,11 @@
 #include <libavutil/mathematics.h>
 #include <libavutil/pixdesc.h>
 #include <sys/event.h>
+#include <sys/sysctl.h>
+#include <sys/syscall.h>
+#include <sys/proc.h>
+#include <sys/user.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -49,9 +56,11 @@
 #include <sys/stat.h>
 #include "assets/browser_icon_assets.h"
 #include "assets/pp_net_icons.h"
+#include "assets/ps_logo_assets.h"
 #include "net/pp_dlna.h"
 #include "net/pp_iptv.h"
 #include "net/pp_dmr.h"
+#include "cjson/cJSON.h"
 
 #ifndef RR_BGRA
 #define RR_BGRA(r,g,b,a) \
@@ -114,8 +123,19 @@ static int g_first_frame_bc_done = 0;
 #define SCREEN_DLNA_SERVERS 20
 #define SCREEN_DLNA_BROWSE  21
 #define SCREEN_IPTV         22
+#define SCREEN_IPTV_CHANNELS 35
 #define SCREEN_URL_ENTRY    23
 #define SCREEN_DMR          24
+#define SCREEN_IPTV_M3U     25
+#define SCREEN_DLNA_HUB     26
+#define SCREEN_WEB_BROWSER  27
+#define SCREEN_WEB_MEDIA    28
+#define SCREEN_STREAMING_HOME    29
+#define SCREEN_STREAMING_CATALOG 30
+#define SCREEN_STREAMING_DETAIL  31
+#define SCREEN_STREAMING_STREAMS 32
+#define SCREEN_STREAMING_SETTINGS 33
+#define SCREEN_STREAMING_ADDONS  34
 
 typedef enum {
     PROFILE_BALANCED = 0,
@@ -135,6 +155,10 @@ static int show_debug_overlay = 0;
 /* PROSPERO_SETTINGS_EARLY_GLOBALS_START */
 static int prospero_resume_playback_enabled = 1;
 static int prospero_default_view_mode = 0;
+/* 4K VIDEO OUTPUT setting: 0 = AUTO (native 4K VO when possible),
+ * 1 = always decode + downscale to 1080 (for non-4K TVs, where the
+ * 4K output plane shows a black picture while audio keeps playing). */
+static int g_4k_output_mode = 0;
 static int prospero_auto_subtitles_enabled = 1;
 /* PROSPERO_SETTINGS_EARLY_GLOBALS_END */
 
@@ -1631,6 +1655,12 @@ const char* profile_name(PlaybackProfile profile) {
 #define PS5_THREAD_COUNT 12
 
 int screen = 0;
+/*
+ * Screen that launched the current playback (DLNA hub, IPTV, recents,
+ * USB browser...). CIRCLE and open failures return here instead of
+ * always landing on the USB page.
+ */
+int g_playback_return_screen = 0;
 int file_count = 0;
 int file_selected = 0;
 int file_scroll = 0;
@@ -1650,7 +1680,7 @@ double pending_resume_pos = 0.0;
 double requested_resume_seek_pos = 0.0;
 double resume_base_offset_seconds = 0.0;
 char pending_resume_path[512] = {0};
-int video_view_mode = 1; // 0=FIT 1=FILL 2=STRETCH
+int video_view_mode = 0; // 0=FIT 1=FILL 2=STRETCH
 long long controls_last_used_ms = 0;
 
 #if PP_BACKEND_ENABLED
@@ -1994,6 +2024,38 @@ static double prospero_media_clock_seconds(void)
     return video_rel;
 }
 static int detected_audio_rate = 48000;
+/*
+ * Software master volume (percent, 0-350). Applied in the audio
+ * output thread right before sceAudioOutOutput; adjusted with
+ * L1/R1 in the player (dedicated OSD) and from DLNA SetVolume.
+ */
+static volatile int g_volume_percent = 100;
+
+/*
+ * Post-seek resync ("buffering") state: after a seek the audio output
+ * is held (silence, clock frozen) and both decoders drop everything
+ * before the target. The first video frame at/after the target is
+ * presented immediately and releases the audio — both clocks restart
+ * from 0 together, so picture and sound resume in sync. A spinner is
+ * shown on screen while this state is active.
+ */
+static volatile int g_seek_resync = 0;
+static volatile double g_seek_resync_target = 0.0;
+static long long g_seek_resync_since_ms = 0;
+static long long g_seek_resync_progress_ms = 0;
+
+/*
+ * Network IO abort: ffmpeg blocking calls (av_read_frame, av_seek_frame,
+ * avformat_open_input) poll this via the interrupt callback. Set when
+ * playback stops so a stuck socket can never freeze the UI on exit.
+ */
+static volatile int g_io_abort = 0;
+
+/* Streaming buffering detection (spinner outside seeks too) */
+static volatile long long g_last_present_ms = 0;
+static volatile unsigned long g_audio_block_seq = 0;
+static long long g_playback_start_ms = 0;
+static long long g_volume_osd_ms = 0;   /* last L1/R1 press, for the OSD */
 static volatile int audio_thread_running = 0;
 static pthread_t audio_thread;
 
@@ -2026,6 +2088,16 @@ void *audio_output_thread(void *arg) {
     while (audio_thread_running) {
         if (screen == 2 && !player_paused && audio_handle >= 1) {
             /*
+             * Post-seek resync: keep feeding silence and do NOT consume
+             * the decoded queue or advance the media clock. The clock
+             * stays frozen at 0 until the first post-target video frame
+             * releases us, so audio and video restart in perfect sync.
+             */
+            if (g_seek_resync) {
+                sceAudioOutOutput(audio_handle, silence);
+                continue;
+            }
+            /*
              * Compare like-for-like: audio_clock is from t=0 of this session,
              * video must be relative to first video PTS (not absolute PTS).
              * Absolute compare freezes easy 720p/YouTube when clocks diverge.
@@ -2042,7 +2114,22 @@ void *audio_output_thread(void *arg) {
                 continue;
             }
             if (audio_queue_count > 0) {
-                sceAudioOutOutput(audio_handle, audio_queue[audio_queue_read]);
+                const int16_t *out_block = audio_queue[audio_queue_read];
+                int vol = g_volume_percent;
+                if (vol != 100) {
+                    /* software gain with hard clipping */
+                    static int16_t volbuf[AUDIO_BLOCK_SAMPLES * 2];
+                    for (int i = 0; i < AUDIO_BLOCK_SAMPLES * 2; i++) {
+                        int s = (int)audio_queue[audio_queue_read][i] * vol;
+                        s /= 100;
+                        if (s > 32767) s = 32767;
+                        if (s < -32768) s = -32768;
+                        volbuf[i] = (int16_t)s;
+                    }
+                    out_block = volbuf;
+                }
+                sceAudioOutOutput(audio_handle, out_block);
+                g_audio_block_seq++;
                 audio_samples_played += AUDIO_BLOCK_SAMPLES;
                 audio_clock_seconds = (double)audio_samples_played / 48000.0;
                 audio_queue_read = (audio_queue_read + 1) % AUDIO_QUEUE_BLOCKS;
@@ -2150,6 +2237,7 @@ int bmp_w = 0;
 int bmp_h = 0;
 int bmp_loaded = 0;
 unsigned char usb_types[256];
+unsigned char usb_port[256];
 
 #define PS5_PAD_BUTTON_OPTIONS 0x0008
 #define PS5_PAD_BUTTON_UP      0x0010
@@ -2177,6 +2265,47 @@ typedef struct PS5_PadData {
 
 int scePadReadState(int, PS5_PadData *);
 
+/*
+ * Left-stick menu navigation: the stick acts like the d-pad, and
+ * holding it in a direction auto-repeats for continuous scrolling.
+ */
+#define PP_STICK_DEADZONE 70
+static int g_stick_dir = 0;
+static long long g_stick_next_rep = 0;
+
+static uint32_t pp_stick_nav_update(uint8_t sx, uint8_t sy) {
+    int dx = (int)sx - 128;
+    int dy = (int)sy - 128;
+    uint32_t dir = 0;
+    int adx = dx < 0 ? -dx : dx;
+    int ady = dy < 0 ? -dy : dy;
+
+    /* dominant axis only, so diagonals don't jump rows and columns */
+    if (adx > PP_STICK_DEADZONE || ady > PP_STICK_DEADZONE) {
+        if (ady >= adx)
+            dir = dy < 0 ? PS5_PAD_BUTTON_UP : PS5_PAD_BUTTON_DOWN;
+        else
+            dir = dx < 0 ? PS5_PAD_BUTTON_LEFT : PS5_PAD_BUTTON_RIGHT;
+    }
+
+    if (!dir) {
+        g_stick_dir = 0;
+        return 0;
+    }
+
+    long long now = now_ms();
+    if ((int)dir != g_stick_dir) {
+        g_stick_dir = (int)dir;
+        g_stick_next_rep = now + 400;   /* pause before auto-repeat */
+        return dir;                     /* first step immediately */
+    }
+    if (now >= g_stick_next_rep) {
+        g_stick_next_rep = now + 110;   /* continuous scroll cadence */
+        return dir;
+    }
+    return 0;
+}
+
 
 typedef struct PS5_VideoBuf {
     void *data;
@@ -2198,6 +2327,7 @@ typedef struct PS5_DrawChunk {
 
 int sceNotificationSend(int userId, bool isLogged, const char* payload);
 int sceKernelSendNotificationRequest(int userId, void* req, size_t size, int flags);
+int sceSystemServiceLaunchWebBrowser(const char *uri, void *reserved);
 int sceKernelAllocateMainDirectMemory(size_t, size_t, int, intptr_t*);
 int sceKernelMapDirectMemory(void**, size_t, int, int, intptr_t, size_t);
 int sceKernelCreateEqueue(struct kevent **, const char *);
@@ -3167,6 +3297,7 @@ void stop_video_playback(void);
 static void prospero_thumbnail_close_context(void);
 int decode_next_video_frame(void);
 long long now_ms(void);
+static void pp_boot_log(const char *step);
 
 void ffmpeg_test(void) {
     char msg[128];
@@ -3316,6 +3447,33 @@ static int prospero_toast_is_error(
 
 /* PROSPERO_TOAST_STATE_END */
 
+/*
+ * The ONLY non-error system notification is the boot "PS PLAY READY"
+ * (the app was launched / the ELF arrived). Everything else — cast
+ * start, receiver connect, play/pause, success messages — stays as
+ * an in-app toast only; in the player, errors alone notify.
+ */
+static int prospero_toast_is_user_event(
+    const char *title,
+    const char *msg
+) {
+    /*
+     * Exactly ONE native notification per launch: the boot
+     * "PS PLAY / READY". Every other event (pad open, play/pause,
+     * casting, success messages) is in-app toast at most.
+     */
+    static int done = 0;
+    if (done || !title || !msg) {
+        return 0;
+    }
+    if (strcasecmp(title, "PS PLAY") == 0 &&
+        strcasecmp(msg, "READY") == 0) {
+        done = 1;
+        return 1;
+    }
+    return 0;
+}
+
 void toast(
     const char *title,
     const char *msg
@@ -3381,10 +3539,11 @@ void toast(
      * (sceKernelSendNotificationRequest) is the only one reliably visible
      * from a payload/BigApp context on all firmwares — the sprx service
      * (sceNotificationSend) renders nothing there.
-     * Errors and user-facing messages always notify; technical spam only
-     * while the Debug profile or overlay is active.
+     * Errors and whitelisted user events (ready / casting / receiver)
+     * always notify; everything else stays as an in-app toast only,
+     * unless the Debug profile or overlay is active.
      */
-    if (error || !technical || debug_enabled) {
+    if (error || prospero_toast_is_user_event(title, msg) || debug_enabled) {
         typedef struct {
             char reserved[45];
             char message[3075];
@@ -3705,11 +3864,42 @@ static void prospero_last_folder_load(void)
 
 
 void load_usb_files(void) {
-    DIR *dir =
-        opendir(current_path);
+    DIR *dir;
 
     file_count = 0;
     file_selected = 0;
+
+    /*
+     * Root view aggregates every USB port (/mnt/usb0..usb3) at once,
+     * so media is scanned on all ports simultaneously.
+     */
+    if (strcmp(current_path, "/mnt/usb0") == 0) {
+        for (int port = 0; port < 4 && file_count < 256; port++) {
+            char port_path[32];
+            snprintf(port_path, sizeof(port_path), "/mnt/usb%d", port);
+            dir = opendir(port_path);
+            if (!dir) continue;
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL && file_count < 256) {
+                if (entry->d_name[0] == '.') continue;
+                if (!strcmp(entry->d_name, "$RECYCLE.BIN")) continue;
+                if (!strcmp(entry->d_name, "System Volume Information")) continue;
+                snprintf(usb_files[file_count], sizeof(usb_files[file_count]),
+                         "%s", entry->d_name);
+                usb_types[file_count] = entry->d_type;
+                usb_port[file_count] = (unsigned char)port;
+                file_count++;
+            }
+            closedir(dir);
+        }
+        if (file_count == 0) {
+            snprintf(usb_files[0], sizeof(usb_files[0]), "NO FILES FOUND");
+            file_count = 1;
+        }
+        return;
+    }
+
+    dir = opendir(current_path);
 
     /*
      * A remembered folder may have been deleted or renamed.
@@ -3917,6 +4107,16 @@ static void prospero_last_folder_save(void);
 void file_action(const char *name) {
     /* Remember the folder containing the selected media. */
     prospero_last_folder_save();
+    if (strcmp(current_path, "/mnt/usb0") == 0 && usb_port[file_selected] > 0) {
+        /* entry came from another port in the merged root view */
+        char rooted[256];
+        snprintf(rooted, sizeof(rooted), "/mnt/usb%d",
+                 (int)usb_port[file_selected]);
+        snprintf(current_path, sizeof(current_path), "%s", rooted);
+        file_action(name);
+        snprintf(current_path, sizeof(current_path), "/mnt/usb0");
+        return;
+    }
     if (has_ext(name, ".mkv")) {
         snprintf(current_media, sizeof(current_media), "%s", name);
         snprintf(current_media_path, sizeof(current_media_path), "%s/%s", current_path, name);
@@ -4119,7 +4319,8 @@ void enter_selected_usb(void) {
         char next[256];
 
         if (strcmp(current_path, "/mnt/usb0") == 0)
-            snprintf(next, sizeof(next), "/mnt/usb0/%s", usb_files[file_selected]);
+            snprintf(next, sizeof(next), "/mnt/usb%d/%s",
+                     (int)usb_port[file_selected], usb_files[file_selected]);
         else
             snprintf(next, sizeof(next), "%s/%s", current_path, usb_files[file_selected]);
 
@@ -4141,6 +4342,12 @@ void usb_go_back(void) {
     char *last = strrchr(current_path, '/');
     if (last && last > current_path) {
         *last = 0;
+    }
+
+    /* from a bare /mnt/usbN jump back to the merged all-ports root */
+    if (strncmp(current_path, "/mnt/usb", 8) == 0 &&
+        strlen(current_path) == 9) {
+        snprintf(current_path, sizeof(current_path), "/mnt/usb0");
     }
 
     load_usb_files();
@@ -4608,7 +4815,7 @@ void draw_image_screen(uint32_t *fb) {
 
 
 
-#define RESUME_FILE "/data/ps5_media_resume.txt"
+#define RESUME_FILE "/data/PS Play/resume.txt"
 
 void save_resume_position(void) {
     double pos;
@@ -4664,6 +4871,8 @@ static void pp_p10_scratch_free(void);
 void stop_video_playback(void) {
     save_resume_position();
     player_paused = 0;
+    g_seek_resync = 0;
+    g_io_abort = 1; /* unblock any ffmpeg network call right now */
 
     prospero_subtitle_clear();
 
@@ -4946,11 +5155,34 @@ static int64_t pp_frame_pts_us(const AVFrame *frame)
 
 int convert_frame_to_rgb(AVFrame *frame) {
     if (!frame) return 0;
+    /*
+     * Seek race guard: a concurrent seek may have unref'd the frame
+     * or flushed the codec mid-decode. An unref'd AVFrame reports
+     * format == -1 / no data — drop it silently instead of taking
+     * the sws "slow path" with garbage (fmt=? crash).
+     */
+    if (frame->format < 0 || frame->width <= 0 || frame->height <= 0 ||
+        !frame->data[0]) {
+        return 0;
+    }
 
 #if PP_BACKEND_ENABLED
     if (g_pp_pb.active) {
         pp_frame pf;
         int64_t pts_us = pp_frame_pts_us(frame);
+
+        /*
+         * Pre-seek-target frame: the renderer would discard it after
+         * a full 4K map/convert. Skip the conversion entirely so the
+         * catch-up to the seek target runs at decode speed.
+         * The first frame at/after the target still goes through and
+         * clears the discard state inside pp_playback_push_frame().
+         */
+        if (g_pp_pb.seek_discarding &&
+            pts_us < g_pp_pb.seek_target_us) {
+            return 0;
+        }
+
         /* Wait briefly for deferred 4K VO — do not convert into dying buffers */
         if (!g_vo_decode_gate) {
             int spins = 0;
@@ -4977,18 +5209,14 @@ int convert_frame_to_rgb(AVFrame *frame) {
             g_pp_pb.stats.aspect = (int)g_pp_pb.cfg.aspect;
             (void)pp_playback_push_frame(&g_pp_pb, &pf);
             video_frame_loaded = pp_playback_has_display(&g_pp_pb);
+            /*
+             * First frame at/after the seek target is on screen:
+             * release the audio — both clocks restart from 0 together.
+             */
+            if (g_seek_resync)
+                g_seek_resync = 0;
+            g_last_present_ms = now_ms();
             return 1;
-        }
-        /* 10-bit / odd formats → sws (much slower). One-shot toast. */
-        {
-            static int s_sws_warned;
-            if (!s_sws_warned) {
-                const char *pn = av_get_pix_fmt_name((enum AVPixelFormat)frame->format);
-                char msg[80];
-                snprintf(msg, sizeof(msg), "slow path fmt=%s", pn ? pn : "?");
-                toast("CONVERT", msg);
-                s_sws_warned = 1;
-            }
         }
     }
 #endif
@@ -5058,6 +5286,14 @@ static pthread_mutex_t prospero_seek_mutex =
 
 static volatile int prospero_seek_pending = 0;
 static volatile int prospero_seek_in_progress = 0;
+/*
+ * Park handshake: decoder threads increment this while inside the
+ * codec critical section (send/receive/convert). The seek path sets
+ * prospero_seek_in_progress and then waits for the count to reach
+ * zero before flushing codec state, so avcodec_flush_buffers() and
+ * av_frame_unref() can never race an in-flight decode.
+ */
+static volatile int prospero_decode_active = 0;
 
 static double prospero_seek_target_seconds = 0.0;
 static int prospero_seek_restore_paused = 0;
@@ -5148,6 +5384,19 @@ static int prospero_process_seek_request(void) {
     pthread_mutex_unlock(
         &prospero_seek_mutex
     );
+
+    /*
+     * Wait until both decoder threads are parked outside the codec
+     * critical section (bounded to ~300ms so a stuck decode cannot
+     * deadlock the seek).
+     */
+    {
+        int park_spins = 0;
+        while (prospero_decode_active > 0 && park_spins < 300) {
+            usleep(1000);
+            park_spins++;
+        }
+    }
 
 #if PP_BACKEND_ENABLED
     pp_playback_notify_seek_begin(
@@ -5287,6 +5536,18 @@ packet_queue_clear(
         first_audio_pts_seconds = -1.0;
         first_video_pts_seconds = -1.0;
 
+        /*
+         * Enter the resync state: audio output stays muted with its
+         * clock frozen until the first video frame at/after the seek
+         * target hits the screen, then both resume together.
+         */
+        if (video_stream_index >= 0) {
+            g_seek_resync_target = target_seconds;
+            g_seek_resync_since_ms = now_ms();
+            g_seek_resync_progress_ms = g_seek_resync_since_ms;
+            g_seek_resync = 1;
+        }
+
         video_decode_done = 0;
         dbg_read_fail = 0;
 
@@ -5309,10 +5570,12 @@ packet_queue_clear(
         }
 
     } else {
-        toast(
-            "SEEK",
-            "Decoder seek failed"
-        );
+        if (demux_thread_running && !g_io_abort) {
+            toast(
+                "SEEK",
+                "Decoder seek failed"
+            );
+        }
     }
 
     prospero_seek_in_progress = 0;
@@ -5409,29 +5672,62 @@ void *demux_thread_func(void *arg) {
                 );
 
                 dbg_video_packets++;
+                if (g_seek_resync)
+                    g_seek_resync_progress_ms = now_ms();
             }
         } else if (
             pkt->stream_index ==
             audio_stream_index
         ) {
+            /*
+             * During post-seek resync the audio output is held, so the
+             * audio queues fill up. Never let a full audio queue block
+             * the demux loop: that starves the video decoder, the seek
+             * target is never reached and the spinner stays forever
+             * (deadlock). Drop the audio packet instead — the decoder
+             * discards pre-target audio anyway, and video MUST keep
+             * flowing to reach the target.
+             */
+            int audio_full_ms = 0;
             while (
                 demux_thread_running &&
                 !player_paused &&
+                !g_seek_resync &&
                 packet_queue_count(
                     &audio_packet_queue
                 ) >= audio_packet_cap
             ) {
                 usleep(1000);
+                /*
+                 * Network streams: if the audio consumer stalls (source
+                 * hiccup, PTS restart), never deadlock the demux loop -
+                 * drop the oldest audio packet so video keeps flowing.
+                 * A momentary audio glitch beats a frozen picture.
+                 */
+                if (g_media_is_network && ++audio_full_ms >= 750) {
+                    AVPacket *stale =
+                        packet_queue_pop(&audio_packet_queue);
+                    if (stale)
+                        av_packet_free(&stale);
+                    audio_full_ms = 0;
+                    pp_boot_log("audio queue stall - dropped oldest");
+                }
             }
 
             if (
                 demux_thread_running &&
-                !player_paused
+                !player_paused &&
+                !(g_seek_resync &&
+                  packet_queue_count(
+                      &audio_packet_queue
+                  ) >= audio_packet_cap)
             ) {
                 packet_queue_push(
                     &audio_packet_queue,
                     pkt
                 );
+                if (g_seek_resync)
+                    g_seek_resync_progress_ms = now_ms();
             }
         }
 
@@ -5474,7 +5770,15 @@ void *video_decode_thread_func(void *arg) {
 
 #if PP_BACKEND_ENABLED
         /* Audio-master wait is inside decode_next_video_frame. */
-        decode_next_video_frame();
+        if (prospero_seek_in_progress) {
+            usleep(1000);
+            continue;
+        }
+        prospero_decode_active++;
+        if (!prospero_seek_in_progress) {
+            decode_next_video_frame();
+        }
+        prospero_decode_active--;
         usleep(playback_profile >= 2 ? 100 : 200);
 #else
         if (video_fps > 1.0) frame_ms = 1000.0 / video_fps;
@@ -5486,7 +5790,15 @@ void *video_decode_thread_func(void *arg) {
         }
 
         if (now >= next_ms) {
-            decode_next_video_frame();
+            if (prospero_seek_in_progress) {
+                usleep(1000);
+                continue;
+            }
+            prospero_decode_active++;
+            if (!prospero_seek_in_progress) {
+                decode_next_video_frame();
+            }
+            prospero_decode_active--;
             next_ms += (long long)(frame_ms);
 
             static double frac = 0.0;
@@ -5670,8 +5982,26 @@ void *audio_decode_thread_func(void *arg) {
             continue;
         }
 
-        while (audio_decode_thread_running && audio_queue_count > 10) {
+        if (prospero_seek_in_progress) {
             usleep(1000);
+            continue;
+        }
+
+        while (audio_decode_thread_running && audio_queue_count > 10 &&
+               !prospero_seek_in_progress) {
+            usleep(1000);
+        }
+
+        if (prospero_seek_in_progress) {
+            usleep(1000);
+            continue;
+        }
+
+        prospero_decode_active++;
+        if (prospero_seek_in_progress) {
+            prospero_decode_active--;
+            usleep(1000);
+            continue;
         }
 
         AVPacket *pkt = packet_queue_pop(&audio_packet_queue);
@@ -5680,6 +6010,7 @@ void *audio_decode_thread_func(void *arg) {
              * Do not terminate at EOF. The demux thread stays alive
              * so an in-place backward seek can refill this queue.
              */
+            prospero_decode_active--;
             usleep(
                 video_decode_done
                     ? 5000
@@ -5691,6 +6022,22 @@ void *audio_decode_thread_func(void *arg) {
 
         if (avcodec_send_packet(audio_ctx, pkt) == 0) {
             while (audio_decode_thread_running && avcodec_receive_frame(audio_ctx, af) == 0) {
+                /*
+                 * Post-seek resync: discard audio decoded before the
+                 * seek target. When the video releases the resync, the
+                 * queue head is right at the target — audio starts
+                 * exactly where the picture starts.
+                 */
+                if (g_seek_resync && af->pts != AV_NOPTS_VALUE &&
+                    play_fmt && audio_stream_index >= 0) {
+                    double apos = af->pts *
+                        av_q2d(play_fmt->streams[audio_stream_index]->time_base);
+                    if (apos < g_seek_resync_target - 0.04) {
+                        av_frame_unref(af);
+                        continue;
+                    }
+                }
+
                 if (af->pts != AV_NOPTS_VALUE && play_fmt && audio_stream_index >= 0) {
                     audio_pts_seconds = af->pts * av_q2d(play_fmt->streams[audio_stream_index]->time_base);
                     if (first_audio_pts_seconds < 0.0)
@@ -5703,6 +6050,7 @@ void *audio_decode_thread_func(void *arg) {
         }
 
         av_packet_free(&pkt);
+        prospero_decode_active--;
     }
 
     av_frame_free(&af);
@@ -6053,13 +6401,27 @@ static void prospero_ffmpeg_error(
         );
     }
 
-    snprintf(
-        message,
-        sizeof(message),
-        "%s: %.76s",
-        stage ? stage : "Playback",
-        reason
-    );
+    if (error_code == AVERROR_HTTP_FORBIDDEN) {
+        snprintf(
+            message,
+            sizeof(message),
+            "403 ACCESS DENIED - SITE BLOCKS DIRECT PLAY - USE PHONE PROXY"
+        );
+    } else if (error_code == AVERROR_HTTP_UNAUTHORIZED) {
+        snprintf(
+            message,
+            sizeof(message),
+            "401 UNAUTHORIZED - STREAM NEEDS LOGIN - USE PHONE PROXY"
+        );
+    } else {
+        snprintf(
+            message,
+            sizeof(message),
+            "%s: %.76s",
+            stage ? stage : "Playback",
+            reason
+        );
+    }
 
     toast(
         "PLAYBACK ERROR",
@@ -6097,8 +6459,30 @@ static void prospero_codec_error(
 }
 
 
+static int prospero_avio_interrupt(void *opaque) {
+    (void)opaque;
+    return g_io_abort ? 1 : 0;
+}
+
+#define PP_BROWSER_UA \
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
 int start_video_playback(const char *path) {
+    /* Remember who launched us (recast while playing keeps the old one) */
+    if (screen != 2)
+        g_playback_return_screen = screen;
     stop_video_playback();
+
+    /*
+     * Drop any seek request left pending by the previous session
+     * (e.g. a DLNA seek that arrived while stopping) so the new
+     * demux thread never applies a stale target.
+     */
+    pthread_mutex_lock(&prospero_seek_mutex);
+    prospero_seek_pending = 0;
+    prospero_seek_in_progress = 0;
+    pthread_mutex_unlock(&prospero_seek_mutex);
 
     prospero_playback_finished = 0;
     prospero_finish_candidate_ms = 0;
@@ -6143,23 +6527,69 @@ int start_video_playback(const char *path) {
      * Values in microseconds unless noted.
      */
     AVDictionary *prospero_net_opts = NULL;
+    g_io_abort = 0;
+    /*
+     * Stream families beyond plain HTTP: RTSP, UDP/RTP multicast IPTV,
+     * RTMP(S), MMS, FTP. Each gets the options its protocol understands.
+     * HTTP(S) also gets a browser User-Agent — many streaming hosts 403
+     * ffmpeg's default "Lavf" agent (anti-hotlink protection).
+     */
+    int net_http = (strncmp(path, "http://", 7) == 0 ||
+                    strncmp(path, "https://", 8) == 0);
+    int net_rtsp = (strncmp(path, "rtsp://", 7) == 0);
+    int net_udp  = (strncmp(path, "udp://", 6) == 0 ||
+                    strncmp(path, "rtp://", 6) == 0);
+    int net_rtmp = (strncmp(path, "rtmp", 4) == 0);
+    int net_mms  = (strncmp(path, "mmsh://", 7) == 0 ||
+                    strncmp(path, "mmst://", 7) == 0);
+    int net_ftp  = (strncmp(path, "ftp://", 6) == 0);
     g_media_is_network =
-        (strncmp(path, "http://", 7) == 0 ||
-         strncmp(path, "https://", 8) == 0)
+        (net_http || net_rtsp || net_udp || net_rtmp || net_mms || net_ftp)
             ? 1
             : 0;
     if (g_media_is_network) {
         av_dict_set(&prospero_net_opts, "timeout", "10000000", 0);
         av_dict_set(&prospero_net_opts, "rw_timeout", "10000000", 0);
-        av_dict_set(&prospero_net_opts, "reconnect", "1", 0);
-        av_dict_set(&prospero_net_opts, "reconnect_streamed", "1", 0);
-        av_dict_set(&prospero_net_opts, "reconnect_on_network_error", "1", 0);
-        av_dict_set(&prospero_net_opts, "reconnect_delay_max", "4", 0);
-        av_dict_set(&prospero_net_opts, "recv_buffer_size", "4194304", 0);
-        av_dict_set(&prospero_net_opts, "tcp_nodelay", "1", 0);
-        av_dict_set(&prospero_net_opts, "short_seek_size", "16777216", 0);
-        av_dict_set(&prospero_net_opts, "probesize", "2097152", 0);
-        av_dict_set(&prospero_net_opts, "analyzeduration", "2000000", 0);
+        av_dict_set(&prospero_net_opts, "probesize", "10485760", 0);
+        av_dict_set(&prospero_net_opts, "analyzeduration", "5000000", 0);
+        if (net_http) {
+            av_dict_set(&prospero_net_opts, "user_agent", PP_BROWSER_UA, 0);
+            av_dict_set(&prospero_net_opts, "reconnect", "1", 0);
+            av_dict_set(&prospero_net_opts, "reconnect_streamed", "1", 0);
+            av_dict_set(&prospero_net_opts, "reconnect_on_network_error", "1", 0);
+            av_dict_set(&prospero_net_opts, "reconnect_delay_max", "4", 0);
+            av_dict_set(&prospero_net_opts, "recv_buffer_size", "8388608", 0);
+            av_dict_set(&prospero_net_opts, "tcp_nodelay", "1", 0);
+            av_dict_set(&prospero_net_opts, "reconnect_on_http_error", "4xx,5xx", 0);
+            av_dict_set(&prospero_net_opts, "short_seek_size", "16777216", 0);
+        }
+        if (net_rtsp) {
+            av_dict_set(&prospero_net_opts, "rtsp_transport", "tcp", 0);
+            av_dict_set(&prospero_net_opts, "buffer_size", "4194304", 0);
+        }
+        if (net_udp) {
+            av_dict_set(&prospero_net_opts, "buffer_size", "8388608", 0);
+            av_dict_set(&prospero_net_opts, "fifo_size", "1000000", 0);
+            av_dict_set(&prospero_net_opts, "overrun_nonfatal", "1", 0);
+        }
+        if (net_rtsp || net_udp) {
+            /*
+             * Live TV: probe fast and play with minimal buffering
+             * instead of building a long delay before the picture.
+             */
+            av_dict_set(&prospero_net_opts, "fflags", "nobuffer", 0);
+            av_dict_set(&prospero_net_opts, "flags", "low_delay", 0);
+            av_dict_set(&prospero_net_opts, "max_delay", "500000", 0);
+            av_dict_set(&prospero_net_opts, "probesize", "1048576", 0);
+            av_dict_set(&prospero_net_opts, "analyzeduration", "1000000", 0);
+        }
+    }
+
+    play_fmt = avformat_alloc_context();
+    if (play_fmt) {
+        play_fmt->interrupt_callback.callback =
+            prospero_avio_interrupt;
+        play_fmt->interrupt_callback.opaque = NULL;
     }
 
     int prospero_open_result =
@@ -6172,6 +6602,56 @@ int start_video_playback(const char *path) {
 
     if (prospero_net_opts) {
         av_dict_free(&prospero_net_opts);
+        prospero_net_opts = NULL;
+    }
+
+    /*
+     * Anti-hotlink retry: some hosts only serve the stream when the
+     * request carries a Referer. We cannot know the embedding page, so
+     * retry once with the stream's own origin — it satisfies the hosts
+     * that merely reject blank/foreign referers.
+     * NOTE: avformat_open_input frees play_fmt on failure, so the
+     * context AND the IO abort callback must be re-created.
+     */
+    if (prospero_open_result < 0 && net_http) {
+        char origin[640];
+        const char *hp = strstr(path, "://");
+        const char *slash;
+        size_t olen;
+        hp = hp ? hp + 3 : path;
+        slash = strchr(hp, '/');
+        olen = slash ? (size_t)(slash - path) : strlen(path);
+        if (olen >= sizeof(origin)) olen = sizeof(origin) - 1;
+        memcpy(origin, path, olen);
+        origin[olen] = 0;
+
+        pp_boot_log("open failed - retrying with referer");
+        av_dict_set(&prospero_net_opts, "user_agent", PP_BROWSER_UA, 0);
+        av_dict_set(&prospero_net_opts, "referer", origin, 0);
+        av_dict_set(&prospero_net_opts, "timeout", "10000000", 0);
+        av_dict_set(&prospero_net_opts, "rw_timeout", "10000000", 0);
+        av_dict_set(&prospero_net_opts, "reconnect", "1", 0);
+        av_dict_set(&prospero_net_opts, "reconnect_streamed", "1", 0);
+        av_dict_set(&prospero_net_opts, "reconnect_on_network_error", "1", 0);
+        av_dict_set(&prospero_net_opts, "reconnect_delay_max", "4", 0);
+        av_dict_set(&prospero_net_opts, "probesize", "10485760", 0);
+        av_dict_set(&prospero_net_opts, "analyzeduration", "5000000", 0);
+
+        play_fmt = avformat_alloc_context();
+        if (play_fmt) {
+            play_fmt->interrupt_callback.callback =
+                prospero_avio_interrupt;
+            play_fmt->interrupt_callback.opaque = NULL;
+        }
+        prospero_open_result =
+            avformat_open_input(
+                &play_fmt,
+                path,
+                NULL,
+                &prospero_net_opts
+            );
+        av_dict_free(&prospero_net_opts);
+        prospero_net_opts = NULL;
     }
 
     if (prospero_open_result < 0) {
@@ -6180,7 +6660,7 @@ int start_video_playback(const char *path) {
             prospero_open_result
         );
 
-        return 0;
+        { screen = g_playback_return_screen; return 0; }
     }
 
     int prospero_stream_result =
@@ -6196,7 +6676,7 @@ int start_video_playback(const char *path) {
         );
 
         stop_video_playback();
-        return 0;
+        { screen = g_playback_return_screen; return 0; }
     }
 
     prospero_subtitle_load_for_media(
@@ -6253,6 +6733,16 @@ int start_video_playback(const char *path) {
 
     char stream_msg[64];
     snprintf(stream_msg, sizeof(stream_msg), "streams:%u", play_fmt->nb_streams);
+    pp_boot_log(stream_msg);
+    for (unsigned int si = 0; si < play_fmt->nb_streams && si < 8; si++) {
+        AVCodecParameters *spar = play_fmt->streams[si]->codecpar;
+        char sl[128];
+        snprintf(sl, sizeof(sl),
+                 "stream %d type=%d codec=%d %dx%d",
+                 si, (int)spar->codec_type, (int)spar->codec_id,
+                 spar->width, spar->height);
+        pp_boot_log(sl);
+    }
 
     if (play_fmt->duration > 0)
         media_duration_sec = (double)play_fmt->duration / (double)AV_TIME_BASE;
@@ -6301,7 +6791,8 @@ int start_video_playback(const char *path) {
                 v8i.has_hdr_metadata = is_pq || is_hlg;
                 pre_gate = (pp_v8_source_gate(&v8i) == PP_V8_GATE_OK);
             }
-            if (pre_gate && PP_4K_STAGE_WANTS_4K_VO) {
+            if (pre_gate && PP_4K_STAGE_WANTS_4K_VO &&
+                g_4k_output_mode == 0) {
                 g_4k_diag_active = 1;
                 g_4k_suppress_audio = !PP_4K_STAGE_WANTS_AUDIO;
                 g_4k_suppress_ui = !PP_4K_STAGE_WANTS_UI;
@@ -6607,7 +7098,8 @@ int start_video_playback(const char *path) {
                      * H.264 8-bit full 2160 can try native; cinema 1920-tall
                      * uses soft@1080 for A/V smoothness.
                      */
-                    if (is_hevc || bpp > 8 || is_pq || is_hlg ||
+                    if (g_4k_output_mode != 0 ||
+                        is_hevc || bpp > 8 || is_pq || is_hlg ||
                         src_h < 2160u || !gate_ok || !PP_4K_STAGE_WANTS_4K_VO ||
                         !PP_4K_NATIVE_VO) {
                         g_4k_diag_active = 0;
@@ -6669,7 +7161,7 @@ int start_video_playback(const char *path) {
                     "decoder unavailable"
                 );
                 stop_video_playback();
-                return 0;
+                { screen = g_playback_return_screen; return 0; }
             }
 
             play_ctx = avcodec_alloc_context3(dec);
@@ -6679,7 +7171,7 @@ int start_video_playback(const char *path) {
                     "Could not allocate decoder context"
                 );
                 stop_video_playback();
-                return 0;
+                { screen = g_playback_return_screen; return 0; }
             }
 
             if (avcodec_parameters_to_context(play_ctx, par) < 0) {
@@ -6688,7 +7180,7 @@ int start_video_playback(const char *path) {
                     "Invalid video stream parameters"
                 );
                 stop_video_playback();
-                return 0;
+                { screen = g_playback_return_screen; return 0; }
             }
 
             /*
@@ -6753,6 +7245,15 @@ int start_video_playback(const char *path) {
             } else if (par->codec_id == AV_CODEC_ID_HEVC) {
                 play_ctx->skip_loop_filter = AVDISCARD_NONREF;
                 play_ctx->skip_frame = AVDISCARD_DEFAULT;
+            } else if ((par->codec_id == AV_CODEC_ID_AV1 ||
+                        par->codec_id == AV_CODEC_ID_VP9) &&
+                       playback_profile >= 2) {
+                /*
+                 * AV1 / VP9 UHD is expensive in software: skip in-loop
+                 * filtering on non-reference frames to stay realtime.
+                 */
+                play_ctx->skip_loop_filter = AVDISCARD_NONREF;
+                play_ctx->skip_frame = AVDISCARD_DEFAULT;
             }
 
             if (avcodec_open2(play_ctx, dec, NULL) < 0) {
@@ -6762,7 +7263,7 @@ int start_video_playback(const char *path) {
                     "decoder could not initialize"
                 );
                 stop_video_playback();
-                return 0;
+                { screen = g_playback_return_screen; return 0; }
             }
 #if PP_BACKEND_ENABLED
             {
@@ -6801,7 +7302,7 @@ int start_video_playback(const char *path) {
             "No playable video or audio track"
         );
         stop_video_playback();
-        return 0;
+        { screen = g_playback_return_screen; return 0; }
     } else if (audio_stream_index < 0 && !g_4k_suppress_audio) {
         /*
          * Common: E-AC3/DDP/Atmos/DTS with FFmpeg built without those decoders.
@@ -6823,7 +7324,7 @@ int start_video_playback(const char *path) {
             "Could not allocate decoder buffers"
         );
         stop_video_playback();
-        return 0;
+        { screen = g_playback_return_screen; return 0; }
     }
 
     player_elapsed = 0;
@@ -6895,10 +7396,10 @@ int start_video_playback(const char *path) {
      * video thread. Local files keep the modest profile caps.
      */
     if (g_media_is_network) {
-        if (video_packet_cap < 256)
-            video_packet_cap = 256;
-        if (audio_packet_cap < 256)
-            audio_packet_cap = 256;
+        if (video_packet_cap < 384)
+            video_packet_cap = 384;
+        if (audio_packet_cap < 384)
+            audio_packet_cap = 384;
     }
 
     demux_thread_running = 1;
@@ -6933,6 +7434,10 @@ int start_video_playback(const char *path) {
     
     prospero_audio_requested_stream = -1;
 
+    g_last_present_ms = 0;
+    g_audio_block_seq = 0;
+    g_playback_start_ms = now_ms();
+
     return 1;
 }
 
@@ -6966,6 +7471,8 @@ static void prospero_video_queue_drain_nonkey(int max_packets)
     }
 }
 
+static int s_vq_starved = 0;
+
 int decode_next_video_frame(void) {
     if (!video_decode_ready || player_paused) return 0;
 
@@ -6995,8 +7502,35 @@ int decode_next_video_frame(void) {
                 video_clock_seconds =
                     play_frame->pts *
                     av_q2d(play_fmt->streams[video_stream_index]->time_base);
-                if (first_video_pts_seconds < 0.0)
+                /*
+                 * During post-seek resync the catch-up frames (keyframe
+                 * up to the target) must not anchor the relative clock:
+                 * the first frame AT/AFTER the target sets it, so
+                 * video_rel starts from 0 exactly when the audio clock
+                 * (frozen at 0) is released.
+                 */
+                int resync_pre_target =
+                    g_seek_resync &&
+                    video_clock_seconds < g_seek_resync_target - 0.001;
+                static double s_last_vclk = -1.0;
+                if (first_video_pts_seconds < 0.0 && !resync_pre_target) {
                     first_video_pts_seconds = video_clock_seconds;
+                    s_last_vclk = -1.0;   /* fresh anchor: skip jump check */
+                } else if (!g_seek_resync && !resync_pre_target &&
+                           s_last_vclk >= 0.0) {
+                    /*
+                     * PTS discontinuity (HLS playlist restarts, IPTV
+                     * source switches): shift the anchor by the jump so
+                     * the A/V delta does not explode by minutes.
+                     */
+                    double vjump = video_clock_seconds - s_last_vclk;
+                    if (vjump > 2.5 || vjump < -2.5) {
+                        first_video_pts_seconds += vjump;
+                        pp_boot_log("video pts jump re-anchored");
+                    }
+                }
+                if (!resync_pre_target)
+                    s_last_vclk = video_clock_seconds;
             }
 
             video_rel = video_clock_seconds - first_video_pts_seconds;
@@ -7005,7 +7539,42 @@ int decode_next_video_frame(void) {
             audio_rel = audio_clock_seconds;
             behind = audio_rel - video_rel; /* >0 => video late; <0 => video early */
 
-            if (audio_rel > 0.05) {
+            /*
+             * Post-seek catch-up: frames before the seek target are
+             * decoded only to be discarded by the renderer. Do NOT pace
+             * them against the audio clock — run the decoder at full
+             * speed until the target, otherwise a +-30 s seek keeps the
+             * picture frozen for the whole pre-keyframe span while the
+             * audio is already playing.
+             */
+            int pre_seek_frame =
+                g_pp_pb.seek_discarding &&
+                video_clock_seconds <
+                    (double)g_pp_pb.seek_target_us / 1000000.0;
+
+            /*
+             * Safety net against unrecoverable desync (network PTS
+             * restarts, stalled clocks): if audio and video sit more
+             * than 3s apart for a sustained run, snap the video anchor
+             * onto the audio clock instead of waiting / racing forever.
+             */
+            if (audio_rel > 0.05 && !pre_seek_frame) {
+                static int s_desync_frames = 0;
+                if (behind > 3.0 || behind < -3.0) {
+                    if (++s_desync_frames >= 45) {
+                        first_video_pts_seconds =
+                            video_clock_seconds - audio_rel;
+                        video_rel = audio_rel;
+                        behind = 0.0;
+                        s_desync_frames = 0;
+                        pp_boot_log("av hard resync applied");
+                    }
+                } else {
+                    s_desync_frames = 0;
+                }
+            }
+
+            if (audio_rel > 0.05 && !pre_seek_frame) {
                 /*
                  * Video ahead of audio: wait for audio, but NEVER freeze the
                  * picture if audio clock stops (underrun / 44.1k stall).
@@ -7041,7 +7610,7 @@ int decode_next_video_frame(void) {
                 /* Badly late vs audio: drop queued non-keys, still show frame */
                 if (behind > 0.45)
                     prospero_video_queue_drain_nonkey(24);
-            } else if (video_fps > 1.0) {
+            } else if (video_fps > 1.0 && !pre_seek_frame) {
                 /*
                  * Audio not running yet: pace by nominal frame interval so
                  * we don't race through the open before audio primes.
@@ -7104,8 +7673,31 @@ int decode_next_video_frame(void) {
         if (!video_video_pending_pkt) {
             if (video_decode_done)
                 return 0;
+            /* network underrun: remember it, then hold below */
+            if (g_media_is_network)
+                s_vq_starved = 1;
             usleep(100);
             return 1;
+        }
+
+        /*
+         * After a network underrun, hold presentation until the queue
+         * refills (~1.5s of video) so playback resumes smoothly instead
+         * of stuttering one packet at a time. The spinner is already
+         * drawn by the render side while we wait.
+         */
+        if (s_vq_starved) {
+            /* never hold back post-seek catch-up frames */
+            if (g_seek_resync) {
+                s_vq_starved = 0;
+            } else if (!video_decode_done &&
+                       packet_queue_count(&video_packet_queue) < 40) {
+                usleep(2000);
+                return 1;
+            } else {
+                s_vq_starved = 0;
+                pp_boot_log("video queue refilled - resuming");
+            }
         }
 
         int send_ret = avcodec_send_packet(play_ctx, video_video_pending_pkt);
@@ -11595,6 +12187,24 @@ static void rr_img(
     int h,
     const unsigned int *img
 );
+static void rr_img_white(
+    uint32_t *fb,
+    int x,
+    int y,
+    int w,
+    int h,
+    const unsigned int *img
+);
+static void rr_img_scaled(
+    uint32_t *fb,
+    int x,
+    int y,
+    int dw,
+    int dh,
+    int sw,
+    int sh,
+    const unsigned int *img
+);
 
 static void rr_bg(uint32_t *fb);
 
@@ -11831,7 +12441,7 @@ static void rr_browser_icon(
 ) {
     switch (type) {
         case 0:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 BR_ICON_FOLDER_W,
                 BR_ICON_FOLDER_H,
@@ -11840,7 +12450,7 @@ static void rr_browser_icon(
             break;
 
         case 1:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 BR_ICON_VIDEO_W,
                 BR_ICON_VIDEO_H,
@@ -11849,7 +12459,7 @@ static void rr_browser_icon(
             break;
 
         case 2:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 BR_ICON_AUDIO_W,
                 BR_ICON_AUDIO_H,
@@ -11858,7 +12468,7 @@ static void rr_browser_icon(
             break;
 
         case 3:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 BR_ICON_IMAGE_W,
                 BR_ICON_IMAGE_H,
@@ -11867,7 +12477,7 @@ static void rr_browser_icon(
             break;
 
         case 4:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 BR_ICON_DOCUMENT_W,
                 BR_ICON_DOCUMENT_H,
@@ -11876,7 +12486,7 @@ static void rr_browser_icon(
             break;
 
         case 5:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 BR_ICON_DISC_W,
                 BR_ICON_DISC_H,
@@ -11885,7 +12495,7 @@ static void rr_browser_icon(
             break;
 
         case 6:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 BR_ICON_HOMEBREW_W,
                 BR_ICON_HOMEBREW_H,
@@ -11894,7 +12504,7 @@ static void rr_browser_icon(
             break;
 
         case 7:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 BR_ICON_ARCHIVE_W,
                 BR_ICON_ARCHIVE_H,
@@ -11903,7 +12513,7 @@ static void rr_browser_icon(
             break;
 
         default:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 BR_ICON_FILE_W,
                 BR_ICON_FILE_H,
@@ -14765,7 +15375,7 @@ void draw_about_support_screen(uint32_t *fb) {
         fb,
         left_x + 148,
         panel_y + 98,
-        "VERSION 1.5",
+        "VERSION 2.1",
         RR_BGRA(199,199,199,225),
         1
     );
@@ -14819,7 +15429,7 @@ void draw_about_support_screen(uint32_t *fb) {
         fb,
         left_x + 58,
         panel_y + 378,
-        "VERSION 1.5",
+        "PS Play 2.1",
         RR_BGRA(232, 244, 255, 235),
         1
     );
@@ -14837,7 +15447,7 @@ void draw_about_support_screen(uint32_t *fb) {
         fb,
         left_x + 58,
         panel_y + 480,
-        "InsideMatrixDev/MounirHero",
+        "PS Play 2.1 by MounirHero - InsideMatrixDev",
         RR_BGRA(205,205,205,235),
         1
     );
@@ -14846,7 +15456,7 @@ void draw_about_support_screen(uint32_t *fb) {
         fb,
         left_x + 58,
         panel_y + 520,
-        "based on: Prospero Player 1.0",
+        "Prospero Player 1.0 by KINGDKAK",
         RR_BGRA(150,150,150,200),
         0
     );
@@ -14936,14 +15546,14 @@ void draw_about_support_screen(uint32_t *fb) {
         fb,
         left_icon_x,
         guide_y - 10,
-        5
+        4
     );
 
     rr_text(
         fb,
         left_text_x,
         guide_y + 6,
-        "MEDIA INFO",
+        "BACK / EXIT APP",
         RR_BGRA(225, 239, 250, 230),
         0
     );
@@ -14954,32 +15564,14 @@ void draw_about_support_screen(uint32_t *fb) {
         fb,
         left_icon_x,
         guide_y - 10,
-        6
+        1
     );
 
     rr_text(
         fb,
         left_text_x,
         guide_y + 6,
-        "SUBTITLES ON / OFF",
-        RR_BGRA(225, 239, 250, 230),
-        0
-    );
-
-    guide_y += 78;
-
-    rr_control(
-        fb,
-        left_icon_x,
-        guide_y - 10,
-        5
-    );
-
-    rr_text(
-        fb,
-        left_text_x,
-        guide_y + 6,
-        "HOLD: SUBTITLE TRACK",
+        "NAVIGATE MENUS",
         RR_BGRA(225, 239, 250, 230),
         0
     );
@@ -14994,42 +15586,6 @@ void draw_about_support_screen(uint32_t *fb) {
         fb,
         right_label_x,
         panel_y + 204,
-        "R2",
-        RR_BGRA(205,205,205,235),
-        1
-    );
-
-    rr_text(
-        fb,
-        right_label_x + 76,
-        panel_y + 208,
-        "AUDIO TRACK",
-        RR_BGRA(225, 239, 250, 230),
-        0
-    );
-
-    rr_text(
-        fb,
-        right_label_x,
-        panel_y + 282,
-        "UP/DN",
-        RR_BGRA(205,205,205,235),
-        1
-    );
-
-    rr_text(
-        fb,
-        right_label_x + 76,
-        panel_y + 286,
-        "MINI PROGRESS BAR",
-        RR_BGRA(225, 239, 250, 230),
-        0
-    );
-
-    rr_text(
-        fb,
-        right_label_x,
-        panel_y + 360,
         "L / R",
         RR_BGRA(205,205,205,235),
         1
@@ -15038,7 +15594,7 @@ void draw_about_support_screen(uint32_t *fb) {
     rr_text(
         fb,
         right_label_x + 96,
-        panel_y + 364,
+        panel_y + 208,
         "SEEK 10 SEC",
         RR_BGRA(225, 239, 250, 230),
         0
@@ -15047,7 +15603,7 @@ void draw_about_support_screen(uint32_t *fb) {
     rr_text(
         fb,
         right_label_x,
-        panel_y + 438,
+        panel_y + 282,
         "L1/R1",
         RR_BGRA(205,205,205,235),
         1
@@ -15056,8 +15612,8 @@ void draw_about_support_screen(uint32_t *fb) {
     rr_text(
         fb,
         right_label_x + 96,
-        panel_y + 442,
-        "SEEK 10 SEC",
+        panel_y + 286,
+        "VOLUME - / +",
         RR_BGRA(225, 239, 250, 230),
         0
     );
@@ -15065,17 +15621,17 @@ void draw_about_support_screen(uint32_t *fb) {
     rr_text(
         fb,
         right_label_x,
-        panel_y + 516,
-        "L3",
+        panel_y + 360,
+        "OPTIONS",
         RR_BGRA(205,205,205,235),
         1
     );
 
     rr_text(
         fb,
-        right_label_x + 126,
-        panel_y + 520,
-        "VIEW MODE",
+        right_label_x + 96,
+        panel_y + 364,
+        "PLAYBACK SETTINGS",
         RR_BGRA(225, 239, 250, 230),
         0
     );
@@ -15084,7 +15640,7 @@ void draw_about_support_screen(uint32_t *fb) {
         fb,
         right_x + 58,
         panel_y + 570,
-        "OPTIONS  STATISTICS     /     CIRCLE  BACK",
+        "OPTIONS  PLAYBACK SETTINGS     /     CIRCLE  BACK",
         RR_BGRA(192,192,192,200),
         0
     );
@@ -16086,12 +16642,13 @@ static void prospero_settings_save(void)
 
     fprintf(
         file,
-        "%d\n%d\n%d\n%d\n%d\n",
+        "%d\n%d\n%d\n%d\n%d\n%d\n",
         (int)current_profile,
         prospero_resume_playback_enabled,
         prospero_default_view_mode,
         prospero_auto_subtitles_enabled,
-        show_debug_overlay
+        show_debug_overlay,
+        g_4k_output_mode
     );
 
     fclose(file);
@@ -16107,6 +16664,7 @@ static void prospero_settings_load(void)
     int loaded_view = 0;
     int loaded_subtitles = 1;
     int loaded_developer = 0;
+    int loaded_4k_mode = 0;
 
     FILE *file =
         fopen(
@@ -16118,22 +16676,31 @@ static void prospero_settings_load(void)
         int values_read =
             fscanf(
                 file,
-                "%d%d%d%d%d",
+                "%d%d%d%d%d%d",
                 &loaded_profile,
                 &loaded_resume,
                 &loaded_view,
                 &loaded_subtitles,
-                &loaded_developer
+                &loaded_developer,
+                &loaded_4k_mode
             );
 
         fclose(file);
 
-        if (values_read != 5) {
+        if (values_read == 5) {
+            /*
+             * v1 -> v2 migration: default aspect is FIT now (old files
+             * may carry FILL/STRETCH) and 4K output starts at AUTO.
+             */
+            loaded_view = 0;
+            loaded_4k_mode = 0;
+        } else if (values_read != 6) {
             loaded_profile = 0;
             loaded_resume = 1;
             loaded_view = 0;
             loaded_subtitles = 1;
             loaded_developer = 0;
+            loaded_4k_mode = 0;
         }
     }
 
@@ -16165,6 +16732,10 @@ static void prospero_settings_load(void)
 
     show_debug_overlay =
         loaded_developer ? 1 : 0;
+
+    if (loaded_4k_mode < 0 || loaded_4k_mode > 1)
+        loaded_4k_mode = 0;
+    g_4k_output_mode = loaded_4k_mode;
 
     video_view_mode =
         prospero_default_view_mode;
@@ -16340,6 +16911,21 @@ static void prospero_settings_activate_selected(void)
         screen = SCREEN_DEVELOPER_TOOLS;
         return;
     }
+
+    if (settings_selected == 7) {
+        g_4k_output_mode = !g_4k_output_mode;
+
+        prospero_settings_save();
+
+        toast(
+            "4K VIDEO OUTPUT",
+            g_4k_output_mode
+                ? "1080P DOWNSCALE"
+                : "AUTO"
+        );
+
+        return;
+    }
 }
 
 /* PROSPERO_PERSISTENT_SETTINGS_END */
@@ -16351,9 +16937,9 @@ void draw_settings_screen(uint32_t *fb) {
     static int settings_frame = 0;
 
     const int row_x = 180;
-    const int row_start_y = 180;
-    const int row_gap = 108;
-    const int settings_count = 7;
+    const int row_start_y = 150;
+    const int row_gap = 96;
+    const int settings_count = 8;
 
     if (settings_selected < 0) {
         settings_selected = 0;
@@ -16425,11 +17011,25 @@ void draw_settings_screen(uint32_t *fb) {
         1
     );
 
+    /* version tag, top-right (same margin as the header) */
+    {
+        const char *ver = "PS PLAY 2.1";
+        rr_text(
+            fb,
+            1920 - 82 - rr_text_width(ver, 1),
+            92,
+            ver,
+            RR_BGRA(150,155,162,225),
+            1
+        );
+    }
+
     char profile_value[96];
     char resume_value[32];
     char view_value[32];
     char subtitle_value[32];
     char uninstall_value[48];
+    char mode4k_value[32];
 
     snprintf(
         profile_value,
@@ -16475,24 +17075,35 @@ void draw_settings_screen(uint32_t *fb) {
             : "REMOVES MEDIA TILE"
     );
 
-    const char *titles[7] = {
+    snprintf(
+        mode4k_value,
+        sizeof(mode4k_value),
+        "%s",
+        g_4k_output_mode
+            ? "1080P DOWNSCALE"
+            : "AUTO"
+    );
+
+    const char *titles[8] = {
         "PLAYBACK PROFILE",
         "RESUME PLAYBACK",
         "DEFAULT ASPECT RATIO",
         "AUTO-DETECT SUBTITLES",
         "DEVELOPER MODE",
         "REMOVE HOME TILE",
-        "DEVELOPER TOOLS"
+        "DEVELOPER TOOLS",
+        "4K VIDEO OUTPUT"
     };
 
-    const char *details[7] = {
+    const char *details[8] = {
         profile_value,
         resume_value,
         view_value,
         subtitle_value,
         show_debug_overlay ? "ON" : "OFF",
         uninstall_value,
-        "LOGS AND DEBUG REPORTS"
+        "LOGS AND DEBUG REPORTS",
+        mode4k_value
     };
 
     /*
@@ -16631,21 +17242,6 @@ void draw_settings_screen(uint32_t *fb) {
         0
     );
 
-    rr_icon(
-        fb,
-        1512,
-        965,
-        3
-    );
-
-    rr_text(
-        fb,
-        1585,
-        997,
-        "PROSPERO SETTINGS",
-        RR_BGRA(203,203,203,205),
-        0
-    );
 }
 
 void draw_profile_screen(uint32_t *fb) {
@@ -16941,7 +17537,20 @@ static void rr_img(uint32_t *fb,int x,int y,int w,int h,const unsigned int *img)
     for(int xx=0;xx<w;xx++){int fx=x+xx;if((unsigned)fx>=1920)continue;
     fb[fy*1920+fx]=rr_blend(fb[fy*1920+fx],img[yy*w+xx]);}}
 }
-/* PS Play 1.5: AMOLED pure-black theme (no floating shapes). */
+/* White-variant: keeps alpha, forces pure white (kills neon-blue tint). */
+static void rr_img_white(uint32_t *fb,int x,int y,int w,int h,const unsigned int *img){
+    for(int yy=0;yy<h;yy++){int fy=y+yy;if((unsigned)fy>=1080)continue;
+    for(int xx=0;xx<w;xx++){int fx=x+xx;if((unsigned)fx>=1920)continue;
+    unsigned px=img[yy*w+xx];unsigned a=(px>>24)&255;if(a<3)continue;
+    fb[fy*1920+fx]=rr_blend(fb[fy*1920+fx],(a<<24)|0x00FFFFFFu);}}
+}
+/* Scaled blit (nearest neighbor) with alpha — used for the enlarged selected tile icon. */
+static void rr_img_scaled(uint32_t *fb,int x,int y,int dw,int dh,int sw,int sh,const unsigned int *img){
+    for(int yy=0;yy<dh;yy++){int fy=y+yy;if((unsigned)fy>=1080)continue;int sy=yy*sh/dh;
+    for(int xx=0;xx<dw;xx++){int fx=x+xx;if((unsigned)fx>=1920)continue;int sx=xx*sw/dw;
+    fb[fy*1920+fx]=rr_blend(fb[fy*1920+fx],img[sy*sw+sx]);}}
+}
+/* PS Play 2.0: AMOLED pure-black theme (no floating shapes). */
 static void rr_bg(uint32_t *fb){uint32_t *p=fb,*e=fb+1920*1080;while(p<e)*p++=0xFF000000u;}
 static void rr_fill(uint32_t *fb,int x,int y,int w,int h,uint32_t c){for(int yy=0;yy<h;yy++)for(int xx=0;xx<w;xx++){int fx=x+xx,fy=y+yy;if((unsigned)fx<1920&&(unsigned)fy<1080)fb[fy*1920+fx]=rr_blend(fb[fy*1920+fx],c);}}
 static int rr_idx(char ch){for(int i=0;i<RR_COUNT;i++)if(RR_CHARS[i]==ch)return i;return -1;}
@@ -16989,8 +17598,108 @@ static int rr_text_width(const char *t,int face){
 static void rr_text_center(uint32_t *fb,int cx,int y,const char *t,uint32_t color,int face){
     rr_text(fb,cx-rr_text_width(t,face)/2,y,t,color,face);
 }
+/*
+ * Web-browser globe icon, generated once at runtime with integer
+ * math only (outer ring, equator, central + side meridians,
+ * two latitude arcs). White on transparent.
+ */
+static unsigned int g_web_icon[72 * 72];
+static int g_web_icon_ready = 0;
+
+static void web_icon_build(void) {
+    if (g_web_icon_ready) return;
+    g_web_icon_ready = 1;
+    memset(g_web_icon, 0, sizeof(g_web_icon));
+
+    const int R = 32;          /* outer radius */
+    for (int y = 0; y < 72; y++) {
+        for (int x = 0; x < 72; x++) {
+            int dx = x - 36;
+            int dy = y - 36;
+            int d2 = dx * dx + dy * dy;
+            int on = 0;
+
+            /* outer ring (about 2.5 px thick) */
+            if (d2 <= R * R && d2 >= (R - 3) * (R - 3)) on = 1;
+            /* equator */
+            if (!on && dy >= -1 && dy <= 1 && d2 < (R - 3) * (R - 3)) on = 1;
+            /* central meridian */
+            if (!on && dx >= -1 && dx <= 1 && d2 < (R - 3) * (R - 3)) on = 1;
+            /* side meridians: ellipse rx=15 ry=29 */
+            if (!on && d2 < (R - 2) * (R - 2)) {
+                long e_num = (long)dx * dx * 29 * 29 + (long)dy * dy * 15 * 15;
+                long e_den = 15L * 15 * 29 * 29;
+                long diff = e_num - e_den;
+                if (diff < 0) diff = -diff;
+                if (diff < e_den / 4) on = 1;
+            }
+            /* latitude arcs: ellipse rx=29 ry=11 centered at dy=+/-13 */
+            if (!on && d2 < (R - 2) * (R - 2)) {
+                for (int s = -1; s <= 1; s += 2) {
+                    int ly = dy - s * 13;
+                    long e_num = (long)dx * dx * 11 * 11 + (long)ly * ly * 29 * 29;
+                    long e_den = 29L * 29 * 11 * 11;
+                    long diff = e_num - e_den;
+                    if (diff < 0) diff = -diff;
+                    if (diff < e_den / 4 && ly * s > 0) on = 1;
+                }
+            }
+
+            if (on)
+                g_web_icon[y * 72 + x] = 0xFFFFFFFFu;
+        }
+    }
+}
+
+/*
+ * Streaming-tile PC icon: stylized desktop monitor (screen outline,
+ * play triangle inside, neck + base stand). White on transparent,
+ * generated once with integer math like the web globe.
+ */
+static unsigned int g_pc_icon[72 * 72];
+static int g_pc_icon_ready = 0;
+
+static void pc_icon_build(void) {
+    if (g_pc_icon_ready) return;
+    g_pc_icon_ready = 1;
+    memset(g_pc_icon, 0, sizeof(g_pc_icon));
+
+    for (int y = 0; y < 72; y++) {
+        for (int x = 0; x < 72; x++) {
+            int on = 0;
+
+            /* monitor frame: rounded-ish rect x 8..63, y 10..49, 3px rim */
+            if (x >= 8 && x <= 63 && y >= 10 && y <= 49 &&
+                (x < 11 || x > 60 || y < 13 || y > 46))
+                on = 1;
+
+            /* play triangle inside the screen: (30,20)-(30,38)-(47,29) */
+            if (!on && y >= 20 && y <= 38) {
+                int half = 9 - (y > 29 ? y - 29 : 29 - y); /* 0..9 */
+                int xend = 30 + half * 17 / 9;
+                if (x >= 30 && x <= xend) on = 1;
+            }
+
+            /* neck + base stand */
+            if (!on && x >= 33 && x <= 38 && y >= 50 && y <= 57) on = 1;
+            if (!on && x >= 23 && x <= 48 && y >= 58 && y <= 61) on = 1;
+
+            if (on)
+                g_pc_icon[y * 72 + x] = 0xFFFFFFFFu;
+        }
+    }
+}
+
 static void rr_icon(uint32_t *fb,int x,int y,int idx){
+    if (idx == 9) { web_icon_build(); rr_img(fb,x,y,72,72,g_web_icon); return; }
+    if (idx == 10) { pc_icon_build(); rr_img(fb,x,y,72,72,g_pc_icon); return; }
     switch(idx){case 0:rr_img(fb,x,y,RR_ICON_BROWSE_USB_W,RR_ICON_BROWSE_USB_H,RR_ICON_BROWSE_USB);break;case 1:rr_img(fb,x,y,RR_ICON_RECENT_FILES_W,RR_ICON_RECENT_FILES_H,RR_ICON_RECENT_FILES);break;case 2:rr_img(fb,x,y,RR_ICON_FAVORITES_W,RR_ICON_FAVORITES_H,RR_ICON_FAVORITES);break;case 3:rr_img(fb,x,y,RR_ICON_SETTINGS_W,RR_ICON_SETTINGS_H,RR_ICON_SETTINGS);break;case 4:rr_img(fb,x,y,RR_ICON_DEVELOPER_TOOLS_W,RR_ICON_DEVELOPER_TOOLS_H,RR_ICON_DEVELOPER_TOOLS);break;case 5:rr_img(fb,x,y,RR_ICON_ABOUT_SUPPORT_W,RR_ICON_ABOUT_SUPPORT_H,RR_ICON_ABOUT_SUPPORT);break;case 6:rr_img(fb,x,y,RR_ICON_CHEVRON_W,RR_ICON_CHEVRON_H,RR_ICON_CHEVRON);break;case 7:rr_img(fb,x,y,RR_ICON_DLNA_W,RR_ICON_DLNA_H,RR_ICON_DLNA);break;case 8:rr_img(fb,x,y,RR_ICON_IPTV_W,RR_ICON_IPTV_H,RR_ICON_IPTV);break;}}
+
+/* Scaled variant (nearest neighbor) for the enlarged selected tile. */
+static void rr_icon_scaled(uint32_t *fb,int x,int y,int idx,int size){
+    if (idx == 9) { web_icon_build(); rr_img_scaled(fb,x,y,size,size,72,72,g_web_icon); return; }
+    if (idx == 10) { pc_icon_build(); rr_img_scaled(fb,x,y,size,size,72,72,g_pc_icon); return; }
+    switch(idx){case 0:rr_img_scaled(fb,x,y,size,size,RR_ICON_BROWSE_USB_W,RR_ICON_BROWSE_USB_H,RR_ICON_BROWSE_USB);break;case 1:rr_img_scaled(fb,x,y,size,size,RR_ICON_RECENT_FILES_W,RR_ICON_RECENT_FILES_H,RR_ICON_RECENT_FILES);break;case 2:rr_img_scaled(fb,x,y,size,size,RR_ICON_FAVORITES_W,RR_ICON_FAVORITES_H,RR_ICON_FAVORITES);break;case 3:rr_img_scaled(fb,x,y,size,size,RR_ICON_SETTINGS_W,RR_ICON_SETTINGS_H,RR_ICON_SETTINGS);break;case 4:rr_img_scaled(fb,x,y,size,size,RR_ICON_DEVELOPER_TOOLS_W,RR_ICON_DEVELOPER_TOOLS_H,RR_ICON_DEVELOPER_TOOLS);break;case 5:rr_img_scaled(fb,x,y,size,size,RR_ICON_ABOUT_SUPPORT_W,RR_ICON_ABOUT_SUPPORT_H,RR_ICON_ABOUT_SUPPORT);break;case 6:rr_img_scaled(fb,x,y,size,size,RR_ICON_CHEVRON_W,RR_ICON_CHEVRON_H,RR_ICON_CHEVRON);break;case 7:rr_img_scaled(fb,x,y,size,size,RR_ICON_DLNA_W,RR_ICON_DLNA_H,RR_ICON_DLNA);break;case 8:rr_img_scaled(fb,x,y,size,size,RR_ICON_IPTV_W,RR_ICON_IPTV_H,RR_ICON_IPTV);break;}}
 static void rr_control(
     uint32_t *fb,
     int x,
@@ -16999,7 +17708,7 @@ static void rr_control(
 ) {
     switch (idx) {
         case 0:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 RR_CONTROL_X_W,
                 RR_CONTROL_X_H,
@@ -17008,7 +17717,7 @@ static void rr_control(
             break;
 
         case 1:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 RR_CONTROL_DPAD_W,
                 RR_CONTROL_DPAD_H,
@@ -17017,7 +17726,7 @@ static void rr_control(
             break;
 
         case 2:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 RR_CONTROL_LEFT_STICK_W,
                 RR_CONTROL_LEFT_STICK_H,
@@ -17026,7 +17735,7 @@ static void rr_control(
             break;
 
         case 3:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 RR_CONTROL_RIGHT_STICK_W,
                 RR_CONTROL_RIGHT_STICK_H,
@@ -17035,7 +17744,7 @@ static void rr_control(
             break;
 
         case 4:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 RR_CONTROL_CIRCLE_W,
                 RR_CONTROL_CIRCLE_H,
@@ -17044,7 +17753,7 @@ static void rr_control(
             break;
 
         case 5:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 RR_CONTROL_TRIANGLE_W,
                 RR_CONTROL_TRIANGLE_H,
@@ -17053,7 +17762,7 @@ static void rr_control(
             break;
 
         case 6:
-            rr_img(
+            rr_img_white(
                 fb, x, y,
                 RR_CONTROL_SQUARE_W,
                 RR_CONTROL_SQUARE_H,
@@ -17068,13 +17777,14 @@ static void rr_control(
 
 void draw_menu_linear(uint32_t *fb, int selected) {
     /*
-     * PS Play 1.5 menu order: receiver first, favourites removed,
+     * PS Play 2.0 menu: receiver + server browser merged into the
+     * single DLNA hub, web browser added, favourites removed,
      * dev tools moved inside Settings.
      */
     const char *titles[7] = {
-        "DLNA RECEIVER",
-        "DLNA / UPNP",
+        "DLNA",
         "IPTV / LIVE TV",
+        "STREMIO",
         "BROWSE USB",
         "RECENT FILES",
         "SETTINGS",
@@ -17082,17 +17792,18 @@ void draw_menu_linear(uint32_t *fb, int selected) {
     };
 
     const char *subs[7] = {
-        "Cast to this console like a Chromecast",
-        "Stream from media servers on your network",
+        "Cast to this console or stream from media servers",
         "Live channels from M3U playlists and URLs",
+        "Movies and series from Stremio addons",
         "Explore videos and folders on USB storage",
         "Continue videos you recently played",
         "Profiles playback preferences and dev tools",
         "Credits project info and support"
     };
 
-    /* Menu entry -> rr_icon index (7 = DLNA cast, 8 = IPTV television). */
-    static const int menu_icon_map[7] = { 7, 7, 8, 0, 1, 3, 5 };
+    /* Menu entry -> rr_icon index (7 = DLNA cast, 8 = IPTV,
+     * 10 = streaming PC). Web browser tile removed in 2.1. */
+    static const int menu_icon_map[7] = { 7, 8, 10, 0, 1, 3, 5 };
 
     static int initialized = 0;
     static int selected_x_fp = 0;
@@ -17102,7 +17813,7 @@ void draw_menu_linear(uint32_t *fb, int selected) {
     static int last_selected = -1;
 
     /*
-     * PS Play horizontal icon row: 7 rounded tiles in a single row,
+     * PS Play horizontal icon row: 8 rounded tiles in a single row,
      * white icons, label under each tile, white glow on the selection.
      */
     const int tw = 150;          /* tile width/height */
@@ -17156,20 +17867,21 @@ void draw_menu_linear(uint32_t *fb, int selected) {
     rr_fill(fb,82,90,5,66,RR_BGRA(255,255,255,225));
     rr_fill(fb,82,152,29,2,RR_BGRA(255,255,255,195));
 
-    rr_text(
+    /* PlayStation logo, left of the title */
+    rr_img(
         fb,
-        122,86,
-        "PS PLAY",
-        RR_BGRA(240,244,248,238),
-        3
+        106,89,
+        RR_PS_LOGO_W,
+        RR_PS_LOGO_H,
+        RR_PS_LOGO
     );
 
     rr_text(
         fb,
-        124,137,
-        "VERSION 1.5",
-        RR_BGRA(150,155,162,225),
-        1
+        106 + RR_PS_LOGO_W + 18,86,
+        "PS PLAY 2.1",
+        RR_BGRA(240,244,248,238),
+        3
     );
 
     /*
@@ -17216,27 +17928,32 @@ void draw_menu_linear(uint32_t *fb, int selected) {
     }
 
     /*
-     * Selection glow glides horizontally between tiles:
+     * Selection glow glides horizontally between tiles and the
+     * selected tile grows ~15% with a brighter outline:
      * soft halo + crisp white border above the tile body.
      */
     {
-        int gx = selected_draw_x;
-        int gy = ty;
-        rr_fill_round(fb, gx-7, gy-7, tw+14, th+14, 30, RR_BGRA(255,255,255,26));
-        rr_fill_round(fb, gx-4, gy-4, tw+8, th+8, 27, RR_BGRA(255,255,255,60));
+        const int grow = 22;                 /* total px added w/h */
+        int sw = tw + grow;
+        int sh = th + grow;
+        int gx = selected_draw_x - grow / 2; /* keep centered on the slot */
+        int gy = ty - grow / 2;
+        rr_fill_round(fb, gx-8, gy-8, sw+16, sh+16, 34, RR_BGRA(255,255,255,30));
+        rr_fill_round(fb, gx-5, gy-5, sw+10, sh+10, 31, RR_BGRA(255,255,255,75));
         /* crisp 2px white ring */
-        rr_fill_round(fb, gx-2, gy-2, tw+4, th+4, 25, RR_BGRA(255,255,255,225));
-        rr_fill_round(fb, gx, gy, tw, th, 24, RR_BGRA(20,21,25,235));
-        rr_icon(
+        rr_fill_round(fb, gx-2, gy-2, sw+4, sh+4, 28, RR_BGRA(255,255,255,240));
+        rr_fill_round(fb, gx, gy, sw, sh, 27, RR_BGRA(20,21,25,240));
+        rr_icon_scaled(
             fb,
-            gx + (tw - 72) / 2,
-            gy + 26,
-            menu_icon_map[selected]
+            gx + (sw - 84) / 2,
+            gy + 32,
+            menu_icon_map[selected],
+            84
         );
         /* re-stamp the selected label in bright white over the glow */
         rr_text_center(
             fb,
-            gx + tw / 2,
+            gx + sw / 2,
             ty + th + 20,
             titles[selected],
             RR_BGRA(255,255,255,245),
@@ -17268,16 +17985,6 @@ void draw_menu_linear(uint32_t *fb, int selected) {
         0
     );
 
-    rr_icon(fb,1480,965,5);
-
-    rr_text(
-        fb,
-        1560,997,
-        "PS PLAY V1.5",
-        RR_BGRA(150,155,162,205),
-        0
-    );
-
     /* Faster initial fade-in. */
     if (fade_alpha > 0) {
         rr_fill(
@@ -17301,7 +18008,7 @@ void draw_menu_linear(uint32_t *fb, int selected) {
 
 #define PP_NET_MAX_SERVERS 16
 #define PP_NET_MAX_ITEMS   512
-#define PP_NET_MAX_IPTV    600
+#define PP_NET_MAX_IPTV    2500
 #define PP_NET_MAX_DEPTH   24
 
 static pthread_mutex_t g_dlna_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -17340,8 +18047,6 @@ static int g_iptv_loaded = 0;
 /* On-screen keyboard for custom stream URLs. */
 static char g_osk_buf[PP_IPTV_MAX_URL];
 static int g_osk_len = 0;
-static int g_osk_row = 0;
-static int g_osk_col = 0;
 
 static void *dlna_discover_worker(void *unused) {
     (void)unused;
@@ -17513,6 +18218,29 @@ static void dlna_refresh_folder(void) {
     dlna_start_browse(g_dlna_cur_server, g_dlna_id_stack[g_dlna_depth - 1]);
 }
 
+/*
+ * Streaming-site cast quirk: some apps cast the bare DASH init
+ * segment (…/init-QUALITY-v1-a1.mp4). That file is only the container
+ * header — no media data — so playback can never start. The playable
+ * twin is the sibling HLS playlist (…/index-QUALITY-v1-a1.m3u8).
+ * Returns 1 when the URL matched the pattern and was rewritten.
+ */
+static int prospero_dash_init_to_hls(const char *url, char *out, size_t cap) {
+    const char *qmark = strchr(url, '?');
+    const char *end = qmark ? qmark : url + strlen(url);
+    const char *name = end;
+    while (name > url && name[-1] != '/') name--;
+    size_t nl = (size_t)(end - name);
+    if (nl < 10) return 0;                          /* "init-x.mp4" */
+    if (strncasecmp(name, "init-", 5) != 0) return 0;
+    if (strncasecmp(end - 4, ".mp4", 4) != 0) return 0;
+    int n = snprintf(out, cap, "%.*sindex-%.*s.m3u8%s",
+                     (int)(name - url), url,
+                     (int)(nl - 5 - 4), name + 5,
+                     qmark ? qmark : "");
+    return n > 0 && (size_t)n < cap;
+}
+
 static void prospero_network_play(const char *url, const char *title) {
     if (!url || !url[0]) {
         toast("STREAM ERROR", "Empty stream address");
@@ -17525,6 +18253,19 @@ static void prospero_network_play(const char *url, const char *title) {
     snprintf(current_media_path, sizeof(current_media_path), "%s", url);
     toast("NETWORK STREAM", current_media);
     screen = SCREEN_PLAYER;
+
+    char hls[700];
+    if (prospero_dash_init_to_hls(url, hls, sizeof(hls))) {
+        pp_boot_log("dash init segment -> trying hls playlist");
+        pp_boot_log(hls);
+        toast("DASH STREAM", "Init segment cast - loading playlist");
+        if (start_video_playback(hls)) {
+            snprintf(current_media_path, sizeof(current_media_path),
+                     "%s", hls);
+            return;
+        }
+        pp_boot_log("hls twin failed - trying original init url");
+    }
     start_video_playback(url);
 }
 
@@ -17543,6 +18284,14 @@ static int g_dmr_started = 0;
 static void prospero_dmr_pump(void) {
     if (!g_dmr_started) return;
 
+    /* a casting device just found us -> one-shot system notification */
+    char dev_ip[64];
+    if (pp_dmr_take_device_event(dev_ip, sizeof(dev_ip))) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "DEVICE CONNECTED - %s", dev_ip);
+        toast("RECEIVER", msg);
+    }
+
     pp_dmr_cmd c;
     while (pp_dmr_take_command(&c)) {
         switch (c.type) {
@@ -17554,7 +18303,7 @@ static void prospero_dmr_pump(void) {
             snprintf(current_media, sizeof(current_media), "%s",
                      c.title[0] ? c.title : "DLNA CAST");
             snprintf(current_media_path, sizeof(current_media_path), "%s", c.url);
-            toast("DLNA CAST", current_media);
+            toast("CASTING", current_media);
             screen = SCREEN_PLAYER;
             start_video_playback(c.url);
             pp_dmr_report_playing();
@@ -17597,7 +18346,13 @@ static void prospero_dmr_pump(void) {
             break;
 
         case PP_DMR_CMD_VOLUME:
-            /* volume state tracked in pp_dmr; no global mixer hook yet */
+            /* DLNA controllers send 0-100; mapped directly onto the
+             * (wider) software master volume range. */
+            g_volume_percent = c.volume;
+            if (g_volume_percent < 0)
+                g_volume_percent = 0;
+            if (g_volume_percent > 350)
+                g_volume_percent = 350;
             break;
 
         default:
@@ -17652,6 +18407,53 @@ static void pp_net_draw_status_line(uint32_t *fb, const char *text) {
     if (text && text[0]) {
         rr_text(fb, 1550, 86, text, RR_BGRA(203,203,203,210), 0);
     }
+}
+
+/* X + TRIANGLE + CIRCLE footer (movies / series screens). */
+static void pp_net_draw_footer_xtc(uint32_t *fb,
+                                   const char *hint_x,
+                                   const char *hint_triangle,
+                                   const char *hint_circle) {
+    rr_fill(fb, 0, 948, 1920, 1, RR_BGRA(186,186,186,48));
+    rr_fill(fb, 0, 949, 1920, 79, RR_BGRA(12,12,12,138));
+
+    int x = 92;
+    rr_control(fb, x, 982, 0);
+    rr_text(fb, x + 56, 998, hint_x, RR_BGRA(209,209,209,205), 0);
+    x += 56 + (int)strlen(hint_x) * 12 + 60;
+
+    rr_control(fb, x, 982, 5);
+    rr_text(fb, x + 56, 998, hint_triangle, RR_BGRA(209,209,209,205), 0);
+    x += 56 + (int)strlen(hint_triangle) * 12 + 60;
+
+    rr_control(fb, x, 982, 4);
+    rr_text(fb, x + 56, 998, hint_circle, RR_BGRA(209,209,209,205), 0);
+}
+
+/* X + SQUARE + TRIANGLE + CIRCLE footer (IPTV channel list). */
+static void pp_net_draw_footer4(uint32_t *fb,
+                                const char *hint_x,
+                                const char *hint_square,
+                                const char *hint_triangle,
+                                const char *hint_circle) {
+    rr_fill(fb, 0, 948, 1920, 1, RR_BGRA(186,186,186,48));
+    rr_fill(fb, 0, 949, 1920, 79, RR_BGRA(12,12,12,138));
+
+    int x = 92;
+    rr_control(fb, x, 982, 0);
+    rr_text(fb, x + 56, 998, hint_x, RR_BGRA(209,209,209,205), 0);
+    x += 56 + (int)strlen(hint_x) * 12 + 60;
+
+    rr_control(fb, x, 982, 6);
+    rr_text(fb, x + 56, 998, hint_square, RR_BGRA(209,209,209,205), 0);
+    x += 56 + (int)strlen(hint_square) * 12 + 60;
+
+    rr_control(fb, x, 982, 5);
+    rr_text(fb, x + 56, 998, hint_triangle, RR_BGRA(209,209,209,205), 0);
+    x += 56 + (int)strlen(hint_triangle) * 12 + 60;
+
+    rr_control(fb, x, 982, 4);
+    rr_text(fb, x + 56, 998, hint_circle, RR_BGRA(209,209,209,205), 0);
 }
 
 static void pp_net_draw_footer3(uint32_t *fb,
@@ -17950,25 +18752,226 @@ void draw_iptv_screen(uint32_t *fb) {
              g_iptv_count == 1 ? "" : "S");
     pp_net_draw_status_line(fb, status);
 
-    int total = g_iptv_count + 1; /* row 0 = custom URL action */
-
-    static pp_net_list_row rows[PP_NET_MAX_IPTV + 1];
-    snprintf(rows[0].title, sizeof(rows[0].title), "CUSTOM URL / STREAM");
+    static pp_net_list_row rows[3];
+    snprintf(rows[0].title, sizeof(rows[0].title), "CHANNEL LIST");
     snprintf(rows[0].detail, sizeof(rows[0].detail),
-             "TYPE ANY HTTP / HLS STREAM ADDRESS");
-    rows[0].icon = 6;
+             "%d CHANNEL%s LOADED - SEARCH WITH TRIANGLE",
+             g_iptv_count, g_iptv_count == 1 ? "" : "S");
+    rows[0].icon = 8;
 
-    for (int i = 0; i < g_iptv_count; i++) {
-        snprintf(rows[i + 1].title, sizeof(rows[i + 1].title), "%s",
-                 g_iptv[i].name);
-        snprintf(rows[i + 1].detail, sizeof(rows[i + 1].detail),
-                 "%s  -  %s", g_iptv[i].group, g_iptv[i].source);
-        rows[i + 1].icon = 6;
+    snprintf(rows[1].title, sizeof(rows[1].title), "CUSTOM URL / STREAM");
+    snprintf(rows[1].detail, sizeof(rows[1].detail),
+             "TYPE ANY HTTP / HLS STREAM ADDRESS");
+    rows[1].icon = 6;
+
+    snprintf(rows[2].title, sizeof(rows[2].title), "LOAD M3U FILE");
+    snprintf(rows[2].detail, sizeof(rows[2].detail),
+             "PICK AN M3U / M3U8 PLAYLIST FROM USB OR DATA");
+    rows[2].icon = 0;
+
+    pp_net_draw_rows(fb, rows, 3, g_iptv_sel, &g_iptv_scrl, frame);
+
+    pp_net_draw_footer3(fb, "OPEN", "", "BACK");
+}
+
+
+/* ------------------------------------------------------------------ */
+/* IPTV channel list - dedicated page with TRIANGLE search.           */
+/* g_iptv_view maps visible rows -> g_iptv indexes (name/group filter) */
+/* ------------------------------------------------------------------ */
+
+static char g_iptv_filter[160] = {0};
+static int g_iptv_view[PP_NET_MAX_IPTV];
+static int g_iptv_view_count = 0;
+static int g_iptv_ch_sel = 0;
+static int g_iptv_ch_scrl = 0;
+
+static int pp_net_icontains(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    if (!nl) return 1;
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i]) {
+            char a = p[i], b = needle[i];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) break;
+            i++;
+        }
+        if (i == nl) return 1;
+    }
+    return 0;
+}
+
+static void pp_iptv_view_rebuild(void) {
+    g_iptv_view_count = 0;
+    for (int i = 0; i < g_iptv_count && i < PP_NET_MAX_IPTV; i++) {
+        if (g_iptv_filter[0] &&
+            !pp_net_icontains(g_iptv[i].name, g_iptv_filter) &&
+            !pp_net_icontains(g_iptv[i].group, g_iptv_filter))
+            continue;
+        g_iptv_view[g_iptv_view_count++] = i;
+    }
+    if (g_iptv_ch_sel >= g_iptv_view_count)
+        g_iptv_ch_sel = g_iptv_view_count > 0 ? g_iptv_view_count - 1 : 0;
+    if (g_iptv_ch_sel < 0) g_iptv_ch_sel = 0;
+}
+
+void draw_iptv_channels_screen(uint32_t *fb) {
+    static int frame = 0;
+    frame++;
+
+    pp_net_draw_header(fb, "IPTV - CHANNEL LIST",
+                       "LIVE CHANNELS FROM YOUR PLAYLISTS", frame);
+
+    char status[128];
+    if (g_iptv_filter[0])
+        snprintf(status, sizeof(status), "%d / %d CHANNELS - SEARCH: %s",
+                 g_iptv_view_count, g_iptv_count, g_iptv_filter);
+    else
+        snprintf(status, sizeof(status), "%d CHANNEL%s", g_iptv_count,
+                 g_iptv_count == 1 ? "" : "S");
+    pp_net_draw_status_line(fb, status);
+
+    static pp_net_list_row rows[PP_NET_MAX_IPTV];
+    int shown = g_iptv_view_count;
+    if (shown == 0) {
+        snprintf(rows[0].title, sizeof(rows[0].title), "%s",
+                 g_iptv_filter[0] ? "NO CHANNEL MATCHES THE SEARCH"
+                                  : "NO CHANNELS FOUND");
+        snprintf(rows[0].detail, sizeof(rows[0].detail), "%s",
+                 g_iptv_filter[0] ? "TRIANGLE TO CHANGE OR CLEAR THE SEARCH"
+                                  : "LOAD AN M3U FILE FROM THE IPTV PAGE");
+        rows[0].icon = 4;
+        shown = 1;
+    } else {
+        for (int i = 0; i < shown; i++) {
+            pp_iptv_channel *c = &g_iptv[g_iptv_view[i]];
+            snprintf(rows[i].title, sizeof(rows[i].title), "%s", c->name);
+            snprintf(rows[i].detail, sizeof(rows[i].detail),
+                     "%s  -  %s", c->group, c->source);
+            rows[i].icon = 6;
+        }
     }
 
-    pp_net_draw_rows(fb, rows, total, g_iptv_sel, &g_iptv_scrl, frame);
+    pp_net_draw_rows(fb, rows, shown, g_iptv_ch_sel, &g_iptv_ch_scrl, frame);
 
-    pp_net_draw_footer3(fb, "PLAY", "RELOAD", "BACK");
+    pp_net_draw_footer4(fb, "PLAY", "RELOAD", "SEARCH", "BACK");
+}
+
+
+/* ------------------------------------------------------------------ */
+/* M3U playlist picker — browse USB for a specific .m3u/.m3u8 file     */
+/* ------------------------------------------------------------------ */
+
+#define PP_M3U_PICK_MAX 128
+
+static char g_m3u_pick_paths[PP_M3U_PICK_MAX][1024];
+static char g_m3u_pick_names[PP_M3U_PICK_MAX][256];
+static int g_m3u_pick_count = 0;
+static int g_m3u_pick_sel = 0;
+static int g_m3u_pick_scrl = 0;
+
+static int m3u_pick_has_ext(const char *name) {
+    size_t n = strlen(name);
+    if (n >= 4 && strcasecmp(name + n - 4, ".m3u") == 0) return 1;
+    if (n >= 5 && strcasecmp(name + n - 5, ".m3u8") == 0) return 1;
+    return 0;
+}
+
+static void m3u_pick_scan_dir(const char *dir, int depth) {
+    if (depth > 4 || g_m3u_pick_count >= PP_M3U_PICK_MAX) return;
+
+    DIR *d = opendir(dir);
+    if (!d) return;
+
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && g_m3u_pick_count < PP_M3U_PICK_MAX) {
+        if (e->d_name[0] == '.') continue;
+
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            m3u_pick_scan_dir(path, depth + 1);
+        } else if (m3u_pick_has_ext(e->d_name)) {
+            snprintf(g_m3u_pick_paths[g_m3u_pick_count],
+                     sizeof(g_m3u_pick_paths[0]), "%s", path);
+            snprintf(g_m3u_pick_names[g_m3u_pick_count],
+                     sizeof(g_m3u_pick_names[0]), "%s", e->d_name);
+            g_m3u_pick_count++;
+        }
+    }
+
+    closedir(d);
+}
+
+static void prospero_iptv_enter_m3u_picker(void) {
+    g_m3u_pick_count = 0;
+    g_m3u_pick_sel = 0;
+    g_m3u_pick_scrl = 0;
+    m3u_pick_scan_dir("/mnt/usb0", 0);
+    m3u_pick_scan_dir("/mnt/usb1", 0);
+    m3u_pick_scan_dir("/data/PS Play", 0);
+    screen = SCREEN_IPTV_M3U;
+}
+
+static void prospero_iptv_load_picked_m3u(int idx) {
+    if (idx < 0 || idx >= g_m3u_pick_count) return;
+
+    int loaded = pp_iptv_parse_file(g_m3u_pick_paths[idx],
+                                    g_m3u_pick_names[idx],
+                                    g_iptv, PP_NET_MAX_IPTV, 0);
+    g_iptv_count = loaded > 0 ? loaded : 0;
+    g_iptv_loaded = 1;
+    g_iptv_sel = 0;
+    g_iptv_scrl = 0;
+
+    if (loaded > 0) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "%s - %d CHANNELS",
+                 g_m3u_pick_names[idx], loaded);
+        toast("IPTV", msg);
+    } else {
+        toast("IPTV", "NO CHANNELS FOUND IN THIS FILE");
+    }
+
+    screen = SCREEN_IPTV;
+}
+
+void draw_iptv_m3u_screen(uint32_t *fb) {
+    static int frame = 0;
+    frame++;
+
+    pp_net_draw_header(fb, "IPTV / LIVE TV",
+                       "CHOOSE AN M3U PLAYLIST FILE FROM USB", frame);
+
+    char status[64];
+    snprintf(status, sizeof(status), "%d FILE%s", g_m3u_pick_count,
+             g_m3u_pick_count == 1 ? "" : "S");
+    pp_net_draw_status_line(fb, status);
+
+    if (g_m3u_pick_count == 0) {
+        rr_text_center(fb, 960, 480,
+                       "NO .M3U / .M3U8 FILES FOUND ON USB",
+                       RR_BGRA(200,200,200,220), 2);
+    } else {
+        static pp_net_list_row rows[PP_M3U_PICK_MAX];
+        for (int i = 0; i < g_m3u_pick_count; i++) {
+            snprintf(rows[i].title, sizeof(rows[i].title), "%s",
+                     g_m3u_pick_names[i]);
+            snprintf(rows[i].detail, sizeof(rows[i].detail), "%s",
+                     g_m3u_pick_paths[i]);
+            rows[i].icon = 4;
+        }
+        pp_net_draw_rows(fb, rows, g_m3u_pick_count,
+                         g_m3u_pick_sel, &g_m3u_pick_scrl, frame);
+    }
+
+    pp_net_draw_footer3(fb, "LOAD", "", "BACK");
 }
 
 /* ------------------------------------------------------------------ */
@@ -18136,7 +19139,8 @@ static void prospero_url_entry_system_keyboard(void) {
                                  g_osk_buf, sizeof(g_osk_buf));
         if (rc == -1) {
             g_osk_ime_failed = 1;
-            toast("KEYBOARD", "SYSTEM KEYBOARD UNAVAILABLE - USING BUILT-IN");
+            toast("KEYBOARD", "SYSTEM KEYBOARD UNAVAILABLE");
+            screen = SCREEN_IPTV;
             return;
         }
         if (rc == 1) { /* user canceled */
@@ -18155,62 +19159,559 @@ static void prospero_url_entry_system_keyboard(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* On-screen keyboard for custom stream URLs                           */
+/* Web browser — launches the system web browser fullscreen, keeps a   */
+/* short history of opened addresses on /data.                         */
 /* ------------------------------------------------------------------ */
 
-static const char *OSK_CHAR_ROWS[] = {
-    "0123456789",
-    "abcdefghijklmnopqrstuvwxyz",
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-    ".-_/:+"
-};
-#define OSK_CHAR_ROW_COUNT 4
-static const char *OSK_KEYS[] = { "DEL", "CLEAR", "SPACE", "PLAY", "CANCEL" };
-#define OSK_KEY_COUNT 5
+#define PP_WEB_HISTORY_MAX  15
+#define PP_WEB_HISTORY_FILE "/data/PS Play/web_history.txt"
 
-static int osk_row_len(int row) {
-    if (row < OSK_CHAR_ROW_COUNT) {
-        return (int)strlen(OSK_CHAR_ROWS[row]);
+static char g_web_history[PP_WEB_HISTORY_MAX][512];
+static int g_web_history_count = 0;
+static int g_web_history_loaded = 0;
+static int g_web_sel = 0;
+static int g_web_scrl = 0;
+
+static void web_history_load(void) {
+    if (g_web_history_loaded) return;
+    g_web_history_loaded = 1;
+
+    FILE *fp = fopen(PP_WEB_HISTORY_FILE, "r");
+    if (!fp) fp = fopen("/data/PSPlay20_web_history.txt", "r"); /* 2.0 path */
+    if (!fp) return;
+
+    char line[512];
+    while (g_web_history_count < PP_WEB_HISTORY_MAX &&
+           fgets(line, sizeof(line), fp)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+            line[--n] = 0;
+        if (n == 0) continue;
+        snprintf(g_web_history[g_web_history_count],
+                 sizeof(g_web_history[0]), "%s", line);
+        g_web_history_count++;
     }
-    return OSK_KEY_COUNT;
+
+    fclose(fp);
 }
 
-static void osk_type_char(char c) {
-    if (g_osk_len < (int)sizeof(g_osk_buf) - 1) {
-        g_osk_buf[g_osk_len++] = c;
-        g_osk_buf[g_osk_len] = 0;
-    }
+static void web_history_save(void) {
+    FILE *fp = fopen(PP_WEB_HISTORY_FILE, "w");
+    if (!fp) return;
+    for (int i = 0; i < g_web_history_count; i++)
+        fprintf(fp, "%s\n", g_web_history[i]);
+    fclose(fp);
 }
 
-static void osk_backspace(void) {
-    if (g_osk_len > 0) {
-        g_osk_buf[--g_osk_len] = 0;
-    }
-}
+static void web_history_add(const char *url) {
+    web_history_load();
 
-static void osk_activate_key(int key) {
-    switch (key) {
-    case 0: osk_backspace(); break;
-    case 1: g_osk_len = 0; g_osk_buf[0] = 0; break;
-    case 2: osk_type_char(' '); break;
-    case 3: {
-        if (strncmp(g_osk_buf, "http://", 7) == 0 ||
-            strncmp(g_osk_buf, "https://", 8) == 0 ||
-            strncmp(g_osk_buf, "rtmp://", 7) == 0 ||
-            strncmp(g_osk_buf, "udp://", 6) == 0 ||
-            strncmp(g_osk_buf, "rtp://", 6) == 0) {
-            prospero_network_play(g_osk_buf, "CUSTOM STREAM");
-        } else {
-            toast("INVALID URL",
-                  "MUST START WITH HTTP:// HTTPS:// RTMP:// OR UDP://");
+    /* drop duplicates, then prepend */
+    for (int i = 0; i < g_web_history_count; i++) {
+        if (strcmp(g_web_history[i], url) == 0) {
+            for (int k = i; k + 1 < g_web_history_count; k++)
+                snprintf(g_web_history[k], sizeof(g_web_history[0]),
+                         "%s", g_web_history[k + 1]);
+            g_web_history_count--;
+            break;
         }
-        break;
     }
-    case 4:
-        screen = SCREEN_IPTV;
-        break;
+
+    if (g_web_history_count >= PP_WEB_HISTORY_MAX)
+        g_web_history_count = PP_WEB_HISTORY_MAX - 1;
+
+    for (int k = g_web_history_count; k > 0; k--)
+        snprintf(g_web_history[k], sizeof(g_web_history[0]),
+                 "%s", g_web_history[k - 1]);
+
+    snprintf(g_web_history[0], sizeof(g_web_history[0]), "%s", url);
+    g_web_history_count++;
+
+    web_history_save();
+}
+
+/* ------------------------------------------------------------------ */
+/* Web media detection + page media scanner                            */
+/*                                                                     */
+/* Direct media URLs entered in PS Play are offered for in-app         */
+/* playback instead of opening the browser. A page can also be         */
+/* scanned: PS Play downloads the HTML itself and lists every media    */
+/* link found on it.                                                   */
+/* ------------------------------------------------------------------ */
+
+static int pp_url_is_media(const char *url) {
+    static const char *exts[] = {
+        ".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".ts", ".m2ts",
+        ".mpg", ".mpeg", ".vob", ".flv", ".wmv", ".3gp",
+        ".m3u8", ".mpd",
+        ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav", ".wma",
+        0
+    };
+    int len = 0;
+    while (url[len] && url[len] != '?' && url[len] != '#') len++;
+    while (len > 0 && url[len - 1] == '/') len--;
+    for (int e = 0; exts[e]; e++) {
+        int el = (int)strlen(exts[e]);
+        if (len < el) continue;
+        int ok = 1;
+        for (int k = 0; k < el; k++) {
+            char a = url[len - el + k];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (a != exts[e][k]) { ok = 0; break; }
+        }
+        if (ok) return 1;
+    }
+    return 0;
+}
+
+static int pp_url_is_audio_media(const char *url) {
+    static const char *exts[] = {
+        ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav", ".wma", 0
+    };
+    int len = 0;
+    while (url[len] && url[len] != '?' && url[len] != '#') len++;
+    for (int e = 0; exts[e]; e++) {
+        int el = (int)strlen(exts[e]);
+        if (len < el) continue;
+        int ok = 1;
+        for (int k = 0; k < el; k++) {
+            char a = url[len - el + k];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (a != exts[e][k]) { ok = 0; break; }
+        }
+        if (ok) return 1;
+    }
+    return 0;
+}
+
+/* "Watch in PS Play?" prompt for detected media links */
+static int g_media_prompt = 0;
+static char g_media_prompt_url[600];
+
+static void prospero_web_offer_media(const char *url) {
+    char fixed[600];
+    if (strncmp(url, "http://", 7) == 0 ||
+        strncmp(url, "https://", 8) == 0) {
+        snprintf(fixed, sizeof(fixed), "%s", url);
+    } else {
+        snprintf(fixed, sizeof(fixed), "https://%s", url);
+    }
+    snprintf(g_media_prompt_url, sizeof(g_media_prompt_url), "%s", fixed);
+    g_media_prompt = 1;
+}
+
+#define PP_WEB_MEDIA_MAX 12
+/* 0 idle, 1 scanning, 2 results, 3 download failed, 4 no media found */
+static volatile int g_web_media_state = 0;
+static int g_web_media_count = 0;
+static char g_web_media_urls[PP_WEB_MEDIA_MAX][600];
+static char g_web_media_page[600];
+static int g_web_media_sel = 0;
+static int g_web_media_scrl = 0;
+
+static void pp_web_media_add(const char *url) {
+    int len = (int)strlen(url);
+    if (len < 12 || len >= 600) return;
+    if (!pp_url_is_media(url)) return;
+    if (g_web_media_count >= PP_WEB_MEDIA_MAX) return;
+    for (int i = 0; i < g_web_media_count; i++)
+        if (strcmp(g_web_media_urls[i], url) == 0) return;
+    snprintf(g_web_media_urls[g_web_media_count], 600, "%s", url);
+    g_web_media_count++;
+}
+
+static void pp_html_unescape(char *s) {
+    char *r = s, *w = s;
+    while (*r) {
+        if (strncmp(r, "&amp;", 5) == 0) { *w++ = '&'; r += 5; }
+        else if (strncmp(r, "&#38;", 5) == 0) { *w++ = '&'; r += 5; }
+        else *w++ = *r++;
+    }
+    *w = 0;
+}
+
+static void pp_web_resolve(char *out, int cap,
+                           const char *base, const char *rel) {
+    if (strncasecmp(rel, "http://", 7) == 0 ||
+        strncasecmp(rel, "https://", 8) == 0) {
+        snprintf(out, cap, "%s", rel);
+        return;
+    }
+    const char *sep = strstr(base, "://");
+    if (!sep) { out[0] = 0; return; }
+    int scheme_len = (int)(sep - base);          /* e.g. "https" */
+    const char *host = sep + 3;
+    const char *host_end = strchr(host, '/');
+    if (!host_end) host_end = host + strlen(host);
+
+    if (rel[0] == '/' && rel[1] == '/') {
+        snprintf(out, cap, "%.*s:%s", scheme_len, base, rel);
+    } else if (rel[0] == '/') {
+        snprintf(out, cap, "%.*s://%.*s%s",
+                 scheme_len, base, (int)(host_end - host), host, rel);
+    } else {
+        const char *slash = host_end + strlen(host_end);
+        while (slash > host_end && slash[-1] != '/') slash--;
+        snprintf(out, cap, "%.*s://%.*s%.*s%s",
+                 scheme_len, base, (int)(host_end - host), host,
+                 (int)(slash - host_end), host_end, rel);
     }
 }
+
+static int pp_web_fetch(const char *url, char *buf, int cap) {
+    AVIOContext *ctx = NULL;
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "timeout", "10000000", 0);      /* us, socket io */
+    av_dict_set(&opts, "tls_verify", "0", 0);          /* no CA store on PS5 */
+    av_dict_set(&opts, "user_agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0 Safari/537.36", 0);
+    int rc = avio_open2(&ctx, url, AVIO_FLAG_READ, NULL, &opts);
+    av_dict_free(&opts);
+    if (rc < 0) return -1;
+
+    int total = 0;
+    while (total < cap - 1) {
+        int want = cap - 1 - total;
+        if (want > 65536) want = 65536;
+        int r = avio_read(ctx, (unsigned char *)buf + total, want);
+        if (r <= 0) break;
+        total += r;
+    }
+    buf[total] = 0;
+    avio_close(ctx);
+    return total;
+}
+
+static void pp_web_scan_html(char *html, const char *base) {
+    /* absolute URLs anywhere in the markup */
+    for (char *p = html; *p && g_web_media_count < PP_WEB_MEDIA_MAX; p++) {
+        if ((p[0] == 'h' || p[0] == 'H') &&
+            (strncasecmp(p, "http://", 7) == 0 ||
+             strncasecmp(p, "https://", 8) == 0)) {
+            char *e = p;
+            while (*e && !strchr("\"' <>\\)\r\n\t|", *e)) e++;
+            char save = *e;
+            *e = 0;
+            pp_html_unescape(p);
+            pp_web_media_add(p);
+            *e = save;
+            p = e;
+        }
+    }
+
+    /* relative links in href= / src= attributes */
+    static const char *attrs[] = { "href=", "src=", 0 };
+    for (int a = 0; attrs[a] && g_web_media_count < PP_WEB_MEDIA_MAX; a++) {
+        int alen = (int)strlen(attrs[a]);
+        for (char *p = html; *p;) {
+            if (strncasecmp(p, attrs[a], alen) != 0) { p++; continue; }
+            char *v = p + alen;
+            char q = *v;
+            if (q != '"' && q != '\'') { p += alen; continue; }
+            v++;
+            char *e = v;
+            while (*e && *e != q) e++;
+            char save = *e;
+            *e = 0;
+            if (pp_url_is_media(v)) {
+                char full[600];
+                pp_web_resolve(full, sizeof(full), base, v);
+                if (full[0]) {
+                    pp_html_unescape(full);
+                    pp_web_media_add(full);
+                }
+            }
+            *e = save;
+            p = e;
+        }
+    }
+}
+
+static void *pp_web_media_scan_thread(void *arg) {
+    (void)arg;
+    int cap = 1500 * 1024;
+    char *html = malloc(cap);
+    if (!html) {
+        g_web_media_state = 3;
+        return NULL;
+    }
+    int n = pp_web_fetch(g_web_media_page, html, cap);
+    if (n <= 0) {
+        free(html);
+        g_web_media_state = 3;
+        return NULL;
+    }
+    pp_web_scan_html(html, g_web_media_page);
+    free(html);
+    g_web_media_state = (g_web_media_count > 0) ? 2 : 4;
+    return NULL;
+}
+
+static void prospero_web_scan_page(void) {
+    int users[4] = {0};
+    sceUserServiceGetLoginUserIdList(users);
+
+    char buf[512];
+    snprintf(buf, sizeof(buf), "https://");
+
+    int rc = pp_ime_get_text(users[0], 1, buf, "PS PLAY - PAGE ADDRESS",
+                             buf, sizeof(buf));
+    if (rc != 0) {
+        if (rc == -1)
+            toast("KEYBOARD", "SYSTEM KEYBOARD UNAVAILABLE");
+        return;
+    }
+
+    char clean[512];
+    int ci = 0;
+    for (const char *p = buf; *p && ci < (int)sizeof(clean) - 1; p++)
+        if (*p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+            clean[ci++] = *p;
+    clean[ci] = 0;
+
+    const char *host = strstr(clean, "://");
+    host = host ? host + 3 : clean;
+    if (strlen(host) <= 3 || !strchr(host, '.')) {
+        toast("INVALID URL", "ENTER A PAGE ADDRESS FIRST");
+        return;
+    }
+
+    if (strncmp(clean, "http://", 7) == 0 ||
+        strncmp(clean, "https://", 8) == 0) {
+        snprintf(g_web_media_page, sizeof(g_web_media_page), "%s", clean);
+    } else {
+        snprintf(g_web_media_page, sizeof(g_web_media_page),
+                 "https://%s", clean);
+    }
+
+    g_web_media_count = 0;
+    g_web_media_sel = 0;
+    g_web_media_scrl = 0;
+    g_web_media_state = 1;
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, pp_web_media_scan_thread, NULL) == 0) {
+        pthread_detach(th);
+        screen = SCREEN_WEB_MEDIA;
+    } else {
+        g_web_media_state = 0;
+        toast("PAGE SCAN", "FAILED TO START THE SCANNER");
+    }
+}
+
+static void prospero_web_launch(const char *url) {
+    char fixed[600];
+    if (strncmp(url, "http://", 7) == 0 ||
+        strncmp(url, "https://", 8) == 0) {
+        snprintf(fixed, sizeof(fixed), "%s", url);
+    } else {
+        snprintf(fixed, sizeof(fixed), "https://%s", url);
+    }
+
+    if (sceSystemServiceLaunchWebBrowser(fixed, NULL) == 0) {
+        web_history_add(fixed);
+        g_web_sel = 0;
+        g_web_scrl = 0;
+    } else {
+        toast("BROWSER", "FAILED TO OPEN THE WEB BROWSER");
+    }
+}
+
+/*
+ * Native keyboard for a web address: accepts plain hosts
+ * (youtube.com) as well as full URLs, https:// is added when missing.
+ */
+static void prospero_web_enter_url(void) {
+    int users[4] = {0};
+    sceUserServiceGetLoginUserIdList(users);
+
+    char buf[512];
+    snprintf(buf, sizeof(buf), "https://");
+
+    for (;;) {
+        int rc = pp_ime_get_text(users[0], 1, buf, "PS PLAY - WEB ADDRESS",
+                                 buf, sizeof(buf));
+        if (rc != 0) {
+            if (rc == -1)
+                toast("KEYBOARD", "SYSTEM KEYBOARD UNAVAILABLE");
+            return; /* canceled or unavailable */
+        }
+
+        /* strip spaces the IME may leave around the text */
+        char clean[512];
+        int ci = 0;
+        for (const char *p = buf; *p && ci < (int)sizeof(clean) - 1; p++)
+            if (*p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+                clean[ci++] = *p;
+        clean[ci] = 0;
+
+        int has_scheme = strncmp(clean, "http://", 7) == 0 ||
+                         strncmp(clean, "https://", 8) == 0;
+        const char *host = has_scheme
+            ? (strstr(clean, "://") + 3)
+            : clean;
+
+        if (strlen(host) > 3 && strchr(host, '.')) {
+            if (pp_url_is_media(clean))
+                prospero_web_offer_media(clean);
+            else
+                prospero_web_launch(clean);
+            return;
+        }
+
+        snprintf(buf, sizeof(buf), "%s", clean);
+        toast("INVALID URL", "ENTER A WEB ADDRESS LIKE YOUTUBE.COM");
+        /* loop: reopen the keyboard for correction */
+    }
+}
+
+static void prospero_web_enter(void) {
+    web_history_load();
+    g_web_sel = 0;
+    g_web_scrl = 0;
+    screen = SCREEN_WEB_BROWSER;
+}
+
+void draw_web_browser_screen(uint32_t *fb) {
+    static int frame = 0;
+    frame++;
+
+    pp_net_draw_header(fb, "WEB BROWSER",
+                       "YOUTUBE AND WEB MEDIA - FULLSCREEN", frame);
+
+    char status[64];
+    snprintf(status, sizeof(status), "%d SAVED", g_web_history_count);
+    pp_net_draw_status_line(fb, status);
+
+    int total = 3 + g_web_history_count;
+
+    static pp_net_list_row rows[3 + PP_WEB_HISTORY_MAX];
+    snprintf(rows[0].title, sizeof(rows[0].title), "ENTER WEB ADDRESS");
+    snprintf(rows[0].detail, sizeof(rows[0].detail),
+             "TYPE AN ADDRESS WITH THE SYSTEM KEYBOARD");
+    rows[0].icon = 7; /* link */
+
+    snprintf(rows[1].title, sizeof(rows[1].title), "FIND MEDIA ON PAGE");
+    snprintf(rows[1].detail, sizeof(rows[1].detail),
+             "SCAN A PAGE AND PLAY THE MEDIA LINKS FOUND ON IT");
+    rows[1].icon = 1; /* video */
+
+    snprintf(rows[2].title, sizeof(rows[2].title), "YOUTUBE");
+    snprintf(rows[2].detail, sizeof(rows[2].detail),
+             "YOUTUBE.COM - WATCH VIDEOS FULLSCREEN");
+    rows[2].icon = 1; /* video */
+
+    for (int i = 0; i < g_web_history_count; i++) {
+        const char *u = g_web_history[i];
+        const char *host = strstr(u, "://");
+        host = host ? host + 3 : u;
+        snprintf(rows[i + 3].title, sizeof(rows[i + 3].title), "%s", host);
+        snprintf(rows[i + 3].detail, sizeof(rows[i + 3].detail),
+                 "HISTORY - %s", u);
+        rows[i + 3].icon = 7;
+    }
+
+    pp_net_draw_rows(fb, rows, total, g_web_sel, &g_web_scrl, frame);
+
+    pp_net_draw_footer3(fb, "OPEN", "", "BACK");
+}
+
+void draw_web_media_screen(uint32_t *fb) {
+    static int frame = 0;
+    frame++;
+
+    pp_net_draw_header(fb, "PAGE MEDIA",
+                       "MEDIA LINKS FOUND ON THE PAGE", frame);
+
+    if (g_web_media_state == 1) {
+        char dots[8];
+        int nd = (frame / 20) % 4;
+        snprintf(dots, sizeof(dots), "%.*s", nd, "...");
+        char st[64];
+        snprintf(st, sizeof(st), "SCANNING PAGE%s", dots);
+        pp_net_draw_status_line(fb, st);
+        pp_net_draw_footer3(fb, "", "", "CANCEL");
+        return;
+    }
+
+    if (g_web_media_state == 3) {
+        pp_net_draw_status_line(fb, "FAILED TO DOWNLOAD THE PAGE");
+        pp_net_draw_footer3(fb, "", "", "BACK");
+        return;
+    }
+    if (g_web_media_state == 4) {
+        pp_net_draw_status_line(fb, "NO MEDIA LINKS FOUND ON THIS PAGE");
+        pp_net_draw_footer3(fb, "", "", "BACK");
+        return;
+    }
+
+    char status[64];
+    snprintf(status, sizeof(status), "%d MEDIA LINKS FOUND",
+             g_web_media_count);
+    pp_net_draw_status_line(fb, status);
+
+    static pp_net_list_row rows[PP_WEB_MEDIA_MAX];
+    for (int i = 0; i < g_web_media_count; i++) {
+        const char *u = g_web_media_urls[i];
+        const char *name = strrchr(u, '/');
+        name = name ? name + 1 : u;
+        char clean_name[120];
+        int ci = 0;
+        for (const char *p = name; *p && *p != '?' &&
+             ci < (int)sizeof(clean_name) - 1; p++)
+            clean_name[ci++] = *p;
+        clean_name[ci] = 0;
+        if (!clean_name[0]) snprintf(clean_name, sizeof(clean_name), "STREAM");
+        snprintf(rows[i].title, sizeof(rows[i].title), "%s", clean_name);
+        snprintf(rows[i].detail, sizeof(rows[i].detail), "%s", u);
+        rows[i].icon = pp_url_is_audio_media(u) ? 2 : 1;
+    }
+
+    pp_net_draw_rows(fb, rows, g_web_media_count,
+                     g_web_media_sel, &g_web_media_scrl, frame);
+
+    pp_net_draw_footer3(fb, "PLAY", "", "BACK");
+}
+
+static void draw_media_prompt(uint32_t *fb) {
+    rr_fill(fb, 0, 0, 1920, 1080, RR_BGRA(0,0,0,175));
+
+    int pw = 940, ph = 330;
+    int px = (1920 - pw) / 2, py = (1080 - ph) / 2;
+    ui_round_asset(fb, px, py, pw, ph, 24,
+                   RR_BGRA(8,8,8,245), RR_BGRA(80,140,255,190),
+                   RR_BGRA(40,90,220,55));
+
+    rr_text_center(fb, 960, py + 52, "MEDIA LINK FOUND",
+                   RR_BGRA(240,244,248,245), 2);
+
+    /* trimmed url */
+    const char *u = g_media_prompt_url;
+    int ul = (int)strlen(u);
+    char short_url[90];
+    if (ul > 84) {
+        snprintf(short_url, sizeof(short_url), "%.40s...%.40s",
+                 u, u + ul - 40);
+    } else {
+        snprintf(short_url, sizeof(short_url), "%s", u);
+    }
+    rr_text_center(fb, 960, py + 112, short_url,
+                   RR_BGRA(150,155,162,225), 1);
+
+    rr_text_center(fb, 960, py + 158, "WATCH IT HERE IN PS PLAY?",
+                   RR_BGRA(203,203,203,235), 1);
+
+    rr_control(fb, 620, py + 226, 0);
+    rr_text(fb, 678, py + 242, "PLAY IN PS PLAY",
+            RR_BGRA(225, 239, 250, 235), 1);
+
+    rr_control(fb, 1060, py + 226, 4);
+    rr_text(fb, 1118, py + 242, "OPEN IN BROWSER",
+            RR_BGRA(225, 239, 250, 235), 1);
+}
+
 
 void draw_url_entry_screen(uint32_t *fb) {
     static int frame = 0;
@@ -18220,9 +19721,9 @@ void draw_url_entry_screen(uint32_t *fb) {
                        "SYSTEM KEYBOARD OPENS AUTOMATICALLY  -  OPTIONS REOPEN", frame);
 
     /* URL field */
-    ui_round_asset(fb, 140, 200, 1640, 90, 14,
-                   RR_BGRA(41,41,41,220), RR_BGRA(205,205,205,160),
-                   RR_BGRA(147,147,147,40));
+    ui_round_asset(fb, 140, 420, 1640, 90, 14,
+                   RR_BGRA(8,8,8,235), RR_BGRA(80,140,255,180),
+                   RR_BGRA(40,90,220,50));
 
     /* show the tail of long URLs */
     const char *disp = g_osk_buf;
@@ -18232,76 +19733,1458 @@ void draw_url_entry_screen(uint32_t *fb) {
     char field[96];
     snprintf(field, sizeof(field), "%s%s", disp,
              (frame / 24) % 2 == 0 ? "_" : " ");
-    rr_text(fb, 172, 230, field, RR_BGRA(232, 244, 255, 240), 2);
+    rr_text(fb, 172, 450, field, RR_BGRA(255, 255, 255, 245), 2);
 
-    /* character grid */
-    const int cell_w = 62;
-    const int cell_h = 60;
-    const int grid_x = 150;
-    const int grid_y = 350;
+    rr_text_center(fb, 960, 560,
+                   "ENTER THE STREAM ADDRESS WITH THE SYSTEM KEYBOARD",
+                   RR_BGRA(170,170,170,220), 1);
 
-    for (int r = 0; r < OSK_CHAR_ROW_COUNT; r++) {
-        const char *chars = OSK_CHAR_ROWS[r];
-        int n = (int)strlen(chars);
-        for (int c = 0; c < n; c++) {
-            int x = grid_x + c * cell_w;
-            int y = grid_y + r * (cell_h + 12);
-            int sel = (g_osk_row == r && g_osk_col == c);
+    pp_net_draw_footer3(fb, "", "SYSTEM KEYBOARD", "CANCEL");
+}
 
-            if (sel) {
-                ui_round_asset(fb, x - 4, y - 6, cell_w - 4, cell_h, 8,
-                               RR_BGRA(147,147,147,200),
-                               RR_BGRA(205,205,205,230),
-                               RR_BGRA(205,205,205,60));
-            } else {
-                ui_round_asset(fb, x - 4, y - 6, cell_w - 4, cell_h, 8,
-                               RR_BGRA(40,40,40,170),
-                               RR_BGRA(105,105,105,120), 0);
+/* ------------------------------------------------------------------ */
+/* STREAMING — native Stremio addon client (Nuvio-style, "Strada C")   */
+/*                                                                     */
+/* Stremio addons are plain HTTPS + JSON services:                     */
+/*   GET {base}/manifest.json                                          */
+/*   GET {base}/catalog/{type}/{id}.json   -> { metas: [...] }         */
+/*   GET {base}/meta/{type}/{id}.json      -> { meta: {...videos} }    */
+/*   GET {base}/stream/{type}/{id}.json    -> { streams: [...] }       */
+/* Fetches go through ffmpeg avio (TLS, no CA store -> tls_verify=0).  */
+/* Everything network-bound runs on detached workers; the UI thread    */
+/* only reads results under g_str_mtx.                                 */
+/* ------------------------------------------------------------------ */
+
+#define PP_STR_MAX_ADDONS    8
+#define PP_STR_MAX_METAS     120
+#define PP_STR_MAX_EPISODES  240
+#define PP_STR_MAX_STREAMS   40
+#define PP_STR_FETCH_CAP     (2500 * 1024)
+#define PP_STR_POSTER_CAP    (6 * 1024 * 1024)
+#define PP_STR_ADDON_FILE    "/data/PS Play/stremio_addons.db"
+#define PP_STR_ADDON_FILE_MID "/data/PS Play/stremio_addons.txt"
+#define PP_STR_ADDON_FILE_OLD "/data/PSPlay20_addons.txt"
+#define PP_STR_USB_DIR       "/mnt/usb0/PS Play"
+#define PP_STR_USB_FILE      "/mnt/usb0/PS Play/Stremio_addons.txt"
+#define PP_STR_DATA_TXT      "/data/PS Play/Stremio_addons.txt"
+#define PP_STR_POSTER_DIR    "/data/PS Play/posters"
+#define PP_STR_CINEMETA      "https://v3-cinemeta.strem.io"
+
+typedef struct {
+    char base[512];
+    char id[96];
+    char name[96];
+    char cat_movie[64];
+    char cat_series[64];
+    int has_stream;
+    int builtin;
+} pp_str_addon;
+
+typedef struct {
+    char id[200];
+    char alt_id[200]; /* imdb (tt...) id from the meta endpoint */
+    char type[16];
+    char name[200];
+    char poster[600];
+    char year[24];
+} pp_str_meta;
+
+typedef struct {
+    char id[220];
+    char title[200];
+    int season;
+    int episode;
+} pp_str_episode;
+
+typedef struct {
+    char name[160];
+    char title[300];
+    char url[1200];
+    int playable;
+} pp_str_stream;
+
+static pthread_mutex_t g_str_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static pp_str_addon g_str_addons[PP_STR_MAX_ADDONS];
+static int g_str_addon_count = 0;
+static int g_str_addons_loaded = 0;
+static int g_str_active = 0;
+static int g_str_hub_sel = 0;
+static int g_str_hub_scrl = 0;
+static volatile int g_str_add_status = 0; /* 0 idle 1 working 2 ok 3 error */
+static char g_str_add_msg[192] = {0};
+static char g_str_add_url[600] = {0};
+
+static pp_str_meta g_str_metas[PP_STR_MAX_METAS];
+static int g_str_meta_count = 0;
+static int g_str_cat_sel = 0;
+static int g_str_cat_scrl = 0;
+static volatile int g_str_cat_status = 0;
+static char g_str_cat_msg[192] = {0};
+static char g_str_cat_type[16] = "movie";
+
+static pp_str_meta g_str_cur;
+static char g_str_desc[900] = {0};
+static pp_str_episode g_str_eps[PP_STR_MAX_EPISODES];
+static int g_str_ep_count = 0;
+static int g_str_det_sel = 0;
+static int g_str_det_scrl = 0;
+static volatile int g_str_det_status = 0;
+static char g_str_det_msg[192] = {0};
+
+static pp_str_stream g_str_streams[PP_STR_MAX_STREAMS];
+static int g_str_stream_count = 0;
+static int g_str_stm_sel = 0;
+static int g_str_stm_scrl = 0;
+static volatile int g_str_stm_status = 0;
+static char g_str_stm_msg[192] = {0};
+static char g_str_stm_id[220] = {0};
+static char g_str_stm_type[16] = {0};
+
+static char g_str_cat_query[300] = {0}; /* url-encoded search, "" = browse */
+static volatile int g_str_import_status = 0; /* 0 idle 1 working 2 ok 3 err */
+static char g_str_import_msg[192] = {0};
+static int g_str_usb_tried = 0;
+static int g_str_set_sel = 0;
+static int g_str_set_scrl = 0;
+static int g_str_alist_sel = 0;
+static int g_str_alist_scrl = 0;
+
+/* Poster slot: one decoded poster at a time, disk cache on /data. */
+static volatile int g_str_poster_status = 0; /* 0 none 1 loading 2 ok 3 fail */
+static char g_str_poster_url[600] = {0};
+static char g_str_poster_req[600] = {0};
+static unsigned int *g_str_poster_px = NULL;
+static int g_str_poster_w = 0;
+static int g_str_poster_h = 0;
+
+static void pp_str_poster_request(const char *url);
+
+/* The font only has A-Z a-z 0-9 space / . _ : - + : filter everything else. */
+static void pp_str_sanitize(const char *in, char *out, size_t cap) {
+    size_t w = 0;
+    if (!cap) return;
+    if (!in) { out[0] = 0; return; }
+    for (const unsigned char *p = (const unsigned char *)in;
+         *p && w + 1 < cap; p++) {
+        unsigned char c = *p;
+        int ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                 (c >= '0' && c <= '9') || c == ' ' || c == '/' ||
+                 c == '.' || c == '_' || c == ':' || c == '-' || c == '+';
+        if (!ok) c = ' ';
+        if (c == ' ' && (w == 0 || out[w - 1] == ' ')) continue;
+        out[w++] = (char)c;
+    }
+    while (w > 0 && out[w - 1] == ' ') w--;
+    out[w] = 0;
+}
+
+static char *pp_str_fetch(const char *url) {
+    char *buf = malloc(PP_STR_FETCH_CAP);
+    if (!buf) return NULL;
+    int n = pp_web_fetch(url, buf, PP_STR_FETCH_CAP);
+    if (n <= 8) { free(buf); return NULL; }
+    return buf;
+}
+
+/* Accept "host", "https://host", or a full ".../manifest.json" URL. */
+static void pp_str_normalize_base(const char *in, char *out, size_t cap) {
+    char tmp[600];
+    size_t w = 0;
+    for (const char *p = in; *p && w + 1 < sizeof(tmp); p++)
+        if (*p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
+            tmp[w++] = *p;
+    tmp[w] = 0;
+
+    if (strncmp(tmp, "http://", 7) == 0 || strncmp(tmp, "https://", 8) == 0)
+        snprintf(out, cap, "%s", tmp);
+    else
+        snprintf(out, cap, "https://%s", tmp);
+
+    size_t n = strlen(out);
+    while (n > 0 && out[n - 1] == '/') out[--n] = 0;
+    const char *mf = "/manifest.json";
+    size_t ml = strlen(mf);
+    if (n > ml && strcasecmp(out + n - ml, mf) == 0)
+        out[n - ml] = 0;
+}
+
+static void pp_str_host_of(const char *base, char *out, size_t cap) {
+    const char *h = strstr(base, "://");
+    h = h ? h + 3 : base;
+    snprintf(out, cap, "%s", h);
+    char *slash = strchr(out, '/');
+    if (slash) *slash = 0;
+}
+
+static int pp_str_parse_manifest(const char *json, pp_str_addon *a) {
+    cJSON *root = cJSON_Parse(json);
+    if (!root) return -1;
+
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
+    cJSON *name = cJSON_GetObjectItemCaseSensitive(root, "name");
+    if (cJSON_IsString(id) && id->valuestring)
+        snprintf(a->id, sizeof(a->id), "%s", id->valuestring);
+    if (cJSON_IsString(name) && name->valuestring)
+        snprintf(a->name, sizeof(a->name), "%s", name->valuestring);
+
+    /* capabilities: "stream" resource (string or object form) */
+    cJSON *res = cJSON_GetObjectItemCaseSensitive(root, "resources");
+    if (cJSON_IsArray(res)) {
+        cJSON *r;
+        cJSON_ArrayForEach(r, res) {
+            const char *rn = NULL;
+            if (cJSON_IsString(r)) rn = r->valuestring;
+            else if (cJSON_IsObject(r)) {
+                cJSON *n = cJSON_GetObjectItemCaseSensitive(r, "name");
+                if (cJSON_IsString(n)) rn = n->valuestring;
+            }
+            if (rn && strcmp(rn, "stream") == 0)
+                a->has_stream = 1;
+        }
+    }
+
+    cJSON *cats = cJSON_GetObjectItemCaseSensitive(root, "catalogs");
+    if (cJSON_IsArray(cats)) {
+        cJSON *c;
+        cJSON_ArrayForEach(c, cats) {
+            cJSON *t = cJSON_GetObjectItemCaseSensitive(c, "type");
+            cJSON *cid = cJSON_GetObjectItemCaseSensitive(c, "id");
+            if (!cJSON_IsString(t) || !cJSON_IsString(cid)) continue;
+            if (strcmp(t->valuestring, "movie") == 0 && !a->cat_movie[0])
+                snprintf(a->cat_movie, sizeof(a->cat_movie), "%s",
+                         cid->valuestring);
+            else if (strcmp(t->valuestring, "series") == 0 &&
+                     !a->cat_series[0])
+                snprintf(a->cat_series, sizeof(a->cat_series), "%s",
+                         cid->valuestring);
+        }
+    }
+
+    cJSON_Delete(root);
+
+    if (!a->name[0])
+        pp_str_host_of(a->base, a->name, sizeof(a->name));
+
+    /* valid if it serves catalogs and/or streams — "types" alone means
+     * nothing: stream-only addons (Torrentio-style) declare types but
+     * have no catalog endpoints, and inventing a "top" catalog id made
+     * MOVIES/SERIES fetch a 404 (CATALOG DOWNLOAD FAILED). */
+    return (a->cat_movie[0] || a->cat_series[0] || a->has_stream) ? 0 : -1;
+}
+
+static void pp_str_addons_save(void); /* defined below */
+
+static void pp_str_addons_load(void) {
+    if (g_str_addons_loaded) return;
+    g_str_addons_loaded = 1;
+
+    memset(&g_str_addons[0], 0, sizeof(g_str_addons[0]));
+    snprintf(g_str_addons[0].base, sizeof(g_str_addons[0].base), "%s",
+             PP_STR_CINEMETA);
+    snprintf(g_str_addons[0].id, sizeof(g_str_addons[0].id), "%s",
+             "com.stremio.cinemeta");
+    snprintf(g_str_addons[0].name, sizeof(g_str_addons[0].name), "%s",
+             "CINEMETA");
+    snprintf(g_str_addons[0].cat_movie, sizeof(g_str_addons[0].cat_movie),
+             "top");
+    snprintf(g_str_addons[0].cat_series, sizeof(g_str_addons[0].cat_series),
+             "top");
+    g_str_addons[0].builtin = 1;
+    g_str_addon_count = 1;
+
+    int migrated = 0;
+    const char *migrated_from = NULL;
+    FILE *fp = fopen(PP_STR_ADDON_FILE, "r");
+    if (!fp) {
+        /* 2.1 early builds saved here (lowercase name) */
+        fp = fopen(PP_STR_ADDON_FILE_MID, "r");
+        if (fp) { migrated = 1; migrated_from = PP_STR_ADDON_FILE_MID; }
+    }
+    if (!fp) {
+        /* one-shot migration from the 2.0 location in /data root */
+        fp = fopen(PP_STR_ADDON_FILE_OLD, "r");
+        if (fp) { migrated = 1; migrated_from = PP_STR_ADDON_FILE_OLD; }
+    }
+    if (!fp) return;
+    char line[1400];
+    while (g_str_addon_count < PP_STR_MAX_ADDONS &&
+           fgets(line, sizeof(line), fp)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+            line[--n] = 0;
+        if (!n) continue;
+        for (char *c = line; *c; c++)
+            if (*c == '|') *c = '\x01';
+
+        pp_str_addon *a = &g_str_addons[g_str_addon_count];
+        memset(a, 0, sizeof(*a));
+        char *f[5] = { line, NULL, NULL, NULL, NULL };
+        char *p = line;
+        for (int i = 1; i < 5; i++) {
+            char *sep = strchr(p, '\x01');
+            if (!sep) break;
+            *sep = 0;
+            f[i] = sep + 1;
+            p = sep + 1;
+        }
+        pp_str_normalize_base(f[0], a->base, sizeof(a->base));
+        if (!a->base[0]) continue;
+        int dup = 0;
+        for (int i = 0; i < g_str_addon_count; i++)
+            if (strcmp(g_str_addons[i].base, a->base) == 0) dup = 1;
+        if (dup) continue;
+        if (f[1]) snprintf(a->name, sizeof(a->name), "%s", f[1]);
+        if (f[4]) {
+            /* 2.1 format: base|name|cat_movie|cat_series|has_stream */
+            if (f[2]) snprintf(a->cat_movie, sizeof(a->cat_movie), "%s", f[2]);
+            if (f[3]) snprintf(a->cat_series, sizeof(a->cat_series), "%s", f[3]);
+            a->has_stream = atoi(f[4]);
+        } else {
+            /* 2.0 file: the catalog ids were guessed by a bad fallback
+             * (stream-only addons got "top" and then 404'd). Drop them
+             * and assume a stream addon — re-add catalog addons. */
+            a->has_stream = 1;
+        }
+        if (!a->name[0]) pp_str_host_of(a->base, a->name, sizeof(a->name));
+        g_str_addon_count++;
+    }
+    fclose(fp);
+    if (migrated && g_str_addon_count > 1) {
+        pp_str_addons_save();
+        if (migrated_from) remove(migrated_from);
+    }
+}
+
+static void pp_str_addons_save(void) {
+    mkdir("/data/PS Play", 0777);
+    FILE *fp = fopen(PP_STR_ADDON_FILE, "w");
+    if (!fp) return;
+    for (int i = 0; i < g_str_addon_count; i++) {
+        pp_str_addon *a = &g_str_addons[i];
+        if (a->builtin) continue;
+        char name[96];
+        snprintf(name, sizeof(name), "%s", a->name);
+        for (char *c = name; *c; c++) if (*c == '|') *c = ' ';
+        fprintf(fp, "%s|%s|%s|%s|%d\n", a->base, name,
+                a->cat_movie, a->cat_series, a->has_stream);
+    }
+    fclose(fp);
+}
+
+/* ------------------------------ workers ------------------------------ */
+
+static void *pp_str_add_worker(void *arg) {
+    (void)arg;
+    pp_str_addon a;
+    memset(&a, 0, sizeof(a));
+    pp_str_normalize_base(g_str_add_url, a.base, sizeof(a.base));
+
+    char url[700];
+    snprintf(url, sizeof(url), "%s/manifest.json", a.base);
+    pp_boot_log("stream addon manifest fetch:");
+    pp_boot_log(url);
+    char *json = pp_str_fetch(url);
+    if (!json || pp_str_parse_manifest(json, &a) != 0) {
+        pp_boot_log("stream addon manifest FAILED");
+        free(json);
+        pthread_mutex_lock(&g_str_mtx);
+        g_str_add_status = 3;
+        snprintf(g_str_add_msg, sizeof(g_str_add_msg), "%s",
+                 json ? "NOT A STREMIO ADDON" : "ADDON NOT REACHABLE");
+        pthread_mutex_unlock(&g_str_mtx);
+        return NULL;
+    }
+    free(json);
+
+    pthread_mutex_lock(&g_str_mtx);
+    int dup = -1;
+    for (int i = 0; i < g_str_addon_count; i++)
+        if (strcmp(g_str_addons[i].base, a.base) == 0) dup = i;
+    if (dup >= 0) {
+        g_str_active = dup;
+        g_str_add_status = 2;
+        snprintf(g_str_add_msg, sizeof(g_str_add_msg),
+                 "ADDON ALREADY INSTALLED");
+    } else if (g_str_addon_count >= PP_STR_MAX_ADDONS) {
+        g_str_add_status = 3;
+        snprintf(g_str_add_msg, sizeof(g_str_add_msg), "ADDON LIST FULL");
+    } else {
+        memcpy(&g_str_addons[g_str_addon_count], &a, sizeof(a));
+        g_str_active = g_str_addon_count;
+        g_str_addon_count++;
+        pp_str_addons_save();
+        g_str_add_status = 2;
+        char nm[96];
+        pp_str_sanitize(a.name, nm, sizeof(nm));
+        snprintf(g_str_add_msg, sizeof(g_str_add_msg), "ADDED - %s", nm);
+    }
+    pthread_mutex_unlock(&g_str_mtx);
+    return NULL;
+}
+
+static void pp_str_add_begin(const char *url) {
+    if (g_str_add_status == 1) return;
+    snprintf(g_str_add_url, sizeof(g_str_add_url), "%s", url);
+    g_str_add_status = 1;
+    snprintf(g_str_add_msg, sizeof(g_str_add_msg), "CHECKING ADDON...");
+    pthread_t t;
+    if (pthread_create(&t, NULL, pp_str_add_worker, NULL) == 0) {
+        pthread_detach(t);
+    } else {
+        g_str_add_status = 3;
+        snprintf(g_str_add_msg, sizeof(g_str_add_msg), "THREAD FAILED");
+    }
+}
+
+/* Addon that served the current catalog — meta requests must go back to
+ * the same addon (ids are only valid there). Set by pp_str_open_catalog. */
+static pp_str_addon g_str_cat_src;
+
+static void pp_str_urlencode(const char *in, char *out, size_t cap) {
+    size_t w = 0;
+    static const char hex[] = "0123456789ABCDEF";
+    for (const unsigned char *p = (const unsigned char *)in;
+         *p && w + 3 < cap; p++) {
+        unsigned char c = *p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+            c == '.' || c == '~') {
+            out[w++] = (char)c;
+        } else {
+            out[w++] = '%';
+            out[w++] = hex[c >> 4];
+            out[w++] = hex[c & 15];
+        }
+    }
+    out[w] = 0;
+}
+
+/* Create /mnt/usb0/PS Play/Stremio_addons.txt with a how-to template. */
+static void pp_str_usb_ensure(void) {
+    struct stat st;
+    mkdir(PP_STR_USB_DIR, 0777);
+    if (stat(PP_STR_USB_FILE, &st) == 0) return;
+    FILE *fp = fopen(PP_STR_USB_FILE, "w");
+    if (!fp) return;
+    fprintf(fp,
+            "# PS PLAY - STREMIO ADDONS\n"
+            "# PASTE ONE ADDON MANIFEST URL PER LINE BELOW (REMOVE THE #).\n"
+            "# USE THE FULL CONFIGURED URL WHEN THE ADDON NEEDS ONE.\n"
+            "# THEY LOAD AUTOMATICALLY WHEN YOU OPEN THE STREMIO PAGE.\n"
+            "#\n"
+            "# EXAMPLE:\n"
+            "# https://my-addon.example.com/eyJhbGciOi.../manifest.json\n");
+    fclose(fp);
+}
+
+static void *pp_str_import_worker(void *arg) {
+    (void)arg;
+    static const char *files[2] = { PP_STR_USB_FILE, PP_STR_DATA_TXT };
+    int opened = 0;
+    char line[700];
+    int added = 0, skipped = 0, failed = 0;
+
+    for (int fi = 0; fi < 2; fi++) {
+    FILE *fp = fopen(files[fi], "r");
+    if (!fp) continue;
+    opened = 1;
+    while (fgets(line, sizeof(line), fp)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+            line[--n] = 0;
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '#') continue;
+
+        char base[512];
+        pp_str_normalize_base(p, base, sizeof(base));
+        if (strlen(base) < 12) continue;
+
+        pthread_mutex_lock(&g_str_mtx);
+        int dup = 0, full = g_str_addon_count >= PP_STR_MAX_ADDONS;
+        for (int i = 0; i < g_str_addon_count; i++)
+            if (strcmp(g_str_addons[i].base, base) == 0) dup = 1;
+        pthread_mutex_unlock(&g_str_mtx);
+        if (dup) { skipped++; continue; }
+        if (full) { failed++; continue; }
+
+        pp_str_addon a;
+        memset(&a, 0, sizeof(a));
+        snprintf(a.base, sizeof(a.base), "%s", base);
+        char url[700];
+        snprintf(url, sizeof(url), "%s/manifest.json", base);
+        pp_boot_log("usb addon manifest fetch:");
+        pp_boot_log(url);
+        char *json = pp_str_fetch(url);
+        if (!json || pp_str_parse_manifest(json, &a) != 0) {
+            free(json);
+            failed++;
+            continue;
+        }
+        free(json);
+
+        pthread_mutex_lock(&g_str_mtx);
+        if (g_str_addon_count < PP_STR_MAX_ADDONS) {
+            memcpy(&g_str_addons[g_str_addon_count], &a, sizeof(a));
+            g_str_addon_count++;
+            added++;
+        } else {
+            failed++;
+        }
+        pthread_mutex_unlock(&g_str_mtx);
+    }
+    fclose(fp);
+    }
+
+    if (!opened) {
+        g_str_import_status = 3;
+        snprintf(g_str_import_msg, sizeof(g_str_import_msg),
+                 "NO STREMIO_ADDONS.TXT IN USB0/PS PLAY OR DATA/PS PLAY");
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_str_mtx);
+    if (added > 0) pp_str_addons_save();
+    g_str_import_status = 2;
+    snprintf(g_str_import_msg, sizeof(g_str_import_msg),
+             "TXT IMPORT - %d ADDED - %d KNOWN - %d FAILED",
+             added, skipped, failed);
+    pthread_mutex_unlock(&g_str_mtx);
+    return NULL;
+}
+
+static void pp_str_usb_import_start(void) {
+    if (g_str_import_status == 1) return;
+    g_str_import_status = 1;
+    snprintf(g_str_import_msg, sizeof(g_str_import_msg),
+             "IMPORTING ADDONS FROM TXT FILES...");
+    pthread_t t;
+    if (pthread_create(&t, NULL, pp_str_import_worker, NULL) == 0) {
+        pthread_detach(t);
+    } else {
+        g_str_import_status = 3;
+        snprintf(g_str_import_msg, sizeof(g_str_import_msg), "THREAD FAILED");
+    }
+}
+
+/* Auto-import once per app run, only when the file has real lines. */
+static void pp_str_usb_auto(void) {
+    if (g_str_usb_tried) return;
+    g_str_usb_tried = 1;
+    pp_str_usb_ensure();
+
+    static const char *files[2] = { PP_STR_USB_FILE, PP_STR_DATA_TXT };
+    int has = 0;
+    for (int fi = 0; fi < 2 && !has; fi++) {
+        FILE *fp = fopen(files[fi], "r");
+        if (!fp) continue;
+        char line[700];
+        while (fgets(line, sizeof(line), fp)) {
+            const char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p && *p != '#' && *p != '\n' && *p != '\r') { has = 1; break; }
+        }
+        fclose(fp);
+    }
+    if (has) {
+        pp_boot_log("stremio_addons.txt found - importing");
+        pp_str_usb_import_start();
+    }
+}
+
+static void *pp_str_catalog_worker(void *arg) {
+    (void)arg;
+    pp_str_addon a;
+    char type[16];
+    char query[300];
+    pthread_mutex_lock(&g_str_mtx);
+    memcpy(&a, &g_str_cat_src, sizeof(a));
+    snprintf(type, sizeof(type), "%s", g_str_cat_type);
+    snprintf(query, sizeof(query), "%s", g_str_cat_query);
+    pthread_mutex_unlock(&g_str_mtx);
+
+    const char *cat = strcmp(type, "movie") == 0 ? a.cat_movie : a.cat_series;
+    char url[800];
+    if (query[0])
+        snprintf(url, sizeof(url), "%s/catalog/%s/%s/search=%s.json",
+                 a.base, type, cat, query);
+    else
+        snprintf(url, sizeof(url), "%s/catalog/%s/%s.json",
+                 a.base, type, cat);
+    pp_boot_log("stream catalog fetch:");
+    pp_boot_log(url);
+
+    char *json = pp_str_fetch(url);
+    if (!json) {
+        pp_boot_log("stream catalog fetch FAILED");
+        pthread_mutex_lock(&g_str_mtx);
+        g_str_cat_status = 3;
+        snprintf(g_str_cat_msg, sizeof(g_str_cat_msg),
+                 "CATALOG DOWNLOAD FAILED");
+        pthread_mutex_unlock(&g_str_mtx);
+        return NULL;
+    }
+
+    pp_str_meta *tmp = calloc(PP_STR_MAX_METAS, sizeof(pp_str_meta));
+    int count = 0;
+    if (tmp) {
+        cJSON *root = cJSON_Parse(json);
+        cJSON *metas = root
+            ? cJSON_GetObjectItemCaseSensitive(root, "metas") : NULL;
+        if (cJSON_IsArray(metas)) {
+            cJSON *m;
+            cJSON_ArrayForEach(m, metas) {
+                if (count >= PP_STR_MAX_METAS) break;
+                cJSON *jid = cJSON_GetObjectItemCaseSensitive(m, "id");
+                cJSON *jname = cJSON_GetObjectItemCaseSensitive(m, "name");
+                if (!cJSON_IsString(jid))
+                    jid = cJSON_GetObjectItemCaseSensitive(m, "imdb_id");
+                if (!cJSON_IsString(jid) || !cJSON_IsString(jname)) continue;
+                pp_str_meta *e = &tmp[count];
+                snprintf(e->id, sizeof(e->id), "%s", jid->valuestring);
+                snprintf(e->name, sizeof(e->name), "%s", jname->valuestring);
+                cJSON *jt = cJSON_GetObjectItemCaseSensitive(m, "type");
+                snprintf(e->type, sizeof(e->type), "%s",
+                         cJSON_IsString(jt) ? jt->valuestring : type);
+                cJSON *jp = cJSON_GetObjectItemCaseSensitive(m, "poster");
+                if (cJSON_IsString(jp) && jp->valuestring)
+                    snprintf(e->poster, sizeof(e->poster), "%s",
+                             jp->valuestring);
+                cJSON *jy = cJSON_GetObjectItemCaseSensitive(m, "releaseInfo");
+                if (!cJSON_IsString(jy))
+                    jy = cJSON_GetObjectItemCaseSensitive(m, "year");
+                if (cJSON_IsString(jy) && jy->valuestring)
+                    snprintf(e->year, sizeof(e->year), "%s", jy->valuestring);
+                count++;
+            }
+        }
+        if (root) cJSON_Delete(root);
+    }
+    free(json);
+
+    pthread_mutex_lock(&g_str_mtx);
+    if (count > 0) {
+        memcpy(g_str_metas, tmp, sizeof(pp_str_meta) * (size_t)count);
+        g_str_meta_count = count;
+        g_str_cat_sel = 0;
+        g_str_cat_scrl = 0;
+        g_str_cat_status = 2;
+        snprintf(g_str_cat_msg, sizeof(g_str_cat_msg), "%d TITLES", count);
+    } else {
+        g_str_meta_count = 0;
+        g_str_cat_status = 3;
+        snprintf(g_str_cat_msg, sizeof(g_str_cat_msg),
+                 tmp ? "EMPTY CATALOG" : "OUT OF MEMORY");
+    }
+    pthread_mutex_unlock(&g_str_mtx);
+    free(tmp);
+    return NULL;
+}
+
+static void pp_str_open_catalog(const char *type) {
+    pp_str_addons_load();
+
+    /* Catalogs come from a catalog-capable addon: the active one if it
+     * serves this type, otherwise the first installed that does
+     * (Cinemeta is always there). Stream-only addons are skipped —
+     * they would just 404 (the "CATALOG DOWNLOAD FAILED" bug). */
+    pp_str_addon *src = NULL;
+    int is_movie = strcmp(type, "movie") == 0;
+    if (g_str_active >= 0 && g_str_active < g_str_addon_count) {
+        pp_str_addon *a = &g_str_addons[g_str_active];
+        if ((is_movie ? a->cat_movie : a->cat_series)[0]) src = a;
+    }
+    if (!src) {
+        for (int i = 0; i < g_str_addon_count; i++) {
+            pp_str_addon *a = &g_str_addons[i];
+            if ((is_movie ? a->cat_movie : a->cat_series)[0]) {
+                src = a;
+                break;
+            }
+        }
+    }
+    if (!src) {
+        toast("STREAMING", "NO CATALOG ADDON INSTALLED");
+        return;
+    }
+    memcpy(&g_str_cat_src, src, sizeof(g_str_cat_src));
+
+    if (g_str_cat_status == 1) return;
+    g_str_add_msg[0] = 0;
+    g_str_add_status = 0;
+    snprintf(g_str_cat_type, sizeof(g_str_cat_type), "%s", type);
+    g_str_meta_count = 0;
+    g_str_cat_sel = 0;
+    g_str_cat_scrl = 0;
+    g_str_cat_status = 1;
+    snprintf(g_str_cat_msg, sizeof(g_str_cat_msg), "LOADING...");
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, pp_str_catalog_worker, NULL) == 0) {
+        pthread_detach(t);
+        screen = SCREEN_STREAMING_CATALOG;
+    } else {
+        g_str_cat_status = 3;
+        snprintf(g_str_cat_msg, sizeof(g_str_cat_msg), "THREAD FAILED");
+    }
+}
+
+static void *pp_str_detail_worker(void *arg) {
+    (void)arg;
+    pp_str_meta cur;
+    char base[512];
+    pthread_mutex_lock(&g_str_mtx);
+    memcpy(&cur, &g_str_cur, sizeof(cur));
+    snprintf(base, sizeof(base), "%s", g_str_cat_src.base);
+    pthread_mutex_unlock(&g_str_mtx);
+
+    char url[900];
+    snprintf(url, sizeof(url), "%s/meta/%s/%s.json", base, cur.type, cur.id);
+    pp_boot_log("stream meta fetch:");
+    pp_boot_log(url);
+    char *json = pp_str_fetch(url);
+    if (!json) {
+        pthread_mutex_lock(&g_str_mtx);
+        g_str_det_status = 3;
+        snprintf(g_str_det_msg, sizeof(g_str_det_msg),
+                 "DETAILS DOWNLOAD FAILED");
+        pthread_mutex_unlock(&g_str_mtx);
+        return NULL;
+    }
+
+    char desc[900] = {0};
+    char poster[600] = {0};
+    char alt_id[200] = {0};
+    pp_str_episode *eps = calloc(PP_STR_MAX_EPISODES, sizeof(pp_str_episode));
+    int ep_count = 0;
+
+    cJSON *root = cJSON_Parse(json);
+    cJSON *meta = root ? cJSON_GetObjectItemCaseSensitive(root, "meta") : NULL;
+    if (cJSON_IsObject(meta)) {
+        cJSON *jd = cJSON_GetObjectItemCaseSensitive(meta, "description");
+        if (cJSON_IsString(jd) && jd->valuestring)
+            snprintf(desc, sizeof(desc), "%s", jd->valuestring);
+        cJSON *jp = cJSON_GetObjectItemCaseSensitive(meta, "poster");
+        if (cJSON_IsString(jp) && jp->valuestring)
+            snprintf(poster, sizeof(poster), "%s", jp->valuestring);
+        /* TMDB-style catalogs use tmdb: ids that stream addons ignore —
+         * keep the imdb tt id for the stream request when available. */
+        cJSON *ji = cJSON_GetObjectItemCaseSensitive(meta, "imdb_id");
+        if (cJSON_IsString(ji) && ji->valuestring &&
+            strncmp(ji->valuestring, "tt", 2) == 0)
+            snprintf(alt_id, sizeof(alt_id), "%s", ji->valuestring);
+
+        cJSON *videos = cJSON_GetObjectItemCaseSensitive(meta, "videos");
+        if (cJSON_IsArray(videos) && eps) {
+            cJSON *v;
+            cJSON_ArrayForEach(v, videos) {
+                if (ep_count >= PP_STR_MAX_EPISODES) break;
+                pp_str_episode *e = &eps[ep_count];
+                cJSON *jid = cJSON_GetObjectItemCaseSensitive(v, "id");
+                cJSON *js = cJSON_GetObjectItemCaseSensitive(v, "season");
+                cJSON *je = cJSON_GetObjectItemCaseSensitive(v, "episode");
+                cJSON *jt = cJSON_GetObjectItemCaseSensitive(v, "title");
+                if (!cJSON_IsString(jt))
+                    jt = cJSON_GetObjectItemCaseSensitive(v, "name");
+                e->season = cJSON_IsNumber(js) ? (int)js->valuedouble : 0;
+                e->episode = cJSON_IsNumber(je) ? (int)je->valuedouble : 0;
+                if (cJSON_IsString(jid) && jid->valuestring)
+                    snprintf(e->id, sizeof(e->id), "%s", jid->valuestring);
+                else if (cur.id[0])
+                    snprintf(e->id, sizeof(e->id), "%s:%d:%d", cur.id,
+                             e->season, e->episode);
+                else
+                    continue;
+                if (cJSON_IsString(jt) && jt->valuestring)
+                    snprintf(e->title, sizeof(e->title), "%s",
+                             jt->valuestring);
+                else
+                    snprintf(e->title, sizeof(e->title), "EPISODE %d",
+                             e->episode);
+                ep_count++;
+            }
+        }
+    }
+    if (root) cJSON_Delete(root);
+    free(json);
+
+    pthread_mutex_lock(&g_str_mtx);
+    if (desc[0]) {
+        pp_str_sanitize(desc, g_str_desc, sizeof(g_str_desc));
+    }
+    if (alt_id[0])
+        snprintf(g_str_cur.alt_id, sizeof(g_str_cur.alt_id), "%s", alt_id);
+    if (poster[0])
+        snprintf(g_str_cur.poster, sizeof(g_str_cur.poster), "%s", poster);
+    if (eps && ep_count > 0) {
+        memcpy(g_str_eps, eps, sizeof(pp_str_episode) * (size_t)ep_count);
+        g_str_ep_count = ep_count;
+    }
+    g_str_det_sel = 0;
+    g_str_det_scrl = 0;
+    g_str_det_status = 2;
+    snprintf(g_str_det_msg, sizeof(g_str_det_msg),
+             g_str_ep_count > 0 ? "%d EPISODES" : "READY", g_str_ep_count);
+    pthread_mutex_unlock(&g_str_mtx);
+    free(eps);
+    return NULL;
+}
+
+static void pp_str_open_detail(int idx) {
+    if (idx < 0 || idx >= g_str_meta_count) return;
+    pthread_mutex_lock(&g_str_mtx);
+    memcpy(&g_str_cur, &g_str_metas[idx], sizeof(pp_str_meta));
+    g_str_desc[0] = 0;
+    g_str_ep_count = 0;
+    g_str_det_sel = 0;
+    g_str_det_scrl = 0;
+    g_str_det_status = 1;
+    snprintf(g_str_det_msg, sizeof(g_str_det_msg), "LOADING...");
+    pthread_mutex_unlock(&g_str_mtx);
+
+    pp_str_poster_request(g_str_cur.poster);
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, pp_str_detail_worker, NULL) == 0) {
+        pthread_detach(t);
+        screen = SCREEN_STREAMING_DETAIL;
+    } else {
+        g_str_det_status = 3;
+        snprintf(g_str_det_msg, sizeof(g_str_det_msg), "THREAD FAILED");
+    }
+}
+
+static void *pp_str_streams_worker(void *arg) {
+    (void)arg;
+    pp_str_addon addons[PP_STR_MAX_ADDONS];
+    int naddons;
+    char type[16], id[220];
+    pthread_mutex_lock(&g_str_mtx);
+    memcpy(addons, g_str_addons, sizeof(addons));
+    naddons = g_str_addon_count;
+    snprintf(type, sizeof(type), "%s", g_str_stm_type);
+    snprintf(id, sizeof(id), "%s", g_str_stm_id);
+    pthread_mutex_unlock(&g_str_mtx);
+
+    /* Stremio semantics: streams are aggregated from EVERY installed
+     * stream addon, not just the active one. */
+    pp_str_stream *tmp = calloc(PP_STR_MAX_STREAMS, sizeof(pp_str_stream));
+    int count = 0, queried = 0;
+    if (tmp) {
+        for (int i = 0; i < naddons && count < PP_STR_MAX_STREAMS; i++) {
+            if (!addons[i].has_stream) continue;
+            queried++;
+
+            char url[1100];
+            snprintf(url, sizeof(url), "%s/stream/%s/%s.json",
+                     addons[i].base, type, id);
+            pp_boot_log("stream sources fetch:");
+            pp_boot_log(url);
+            char *json = pp_str_fetch(url);
+            if (!json) {
+                pp_boot_log("stream sources fetch FAILED");
+                continue;
             }
 
-            char s[2] = { chars[c], 0 };
-            rr_text(fb, x + 14, y + 10, s,
-                    sel ? RR_BGRA(255, 255, 255, 255)
-                        : RR_BGRA(232,232,232,220),
-                    2);
+            cJSON *root = cJSON_Parse(json);
+            cJSON *streams = root
+                ? cJSON_GetObjectItemCaseSensitive(root, "streams") : NULL;
+            if (cJSON_IsArray(streams)) {
+                cJSON *s;
+                cJSON_ArrayForEach(s, streams) {
+                    if (count >= PP_STR_MAX_STREAMS) break;
+                    pp_str_stream *e = &tmp[count];
+                    memset(e, 0, sizeof(*e));
+                    cJSON *jn = cJSON_GetObjectItemCaseSensitive(s, "name");
+                    cJSON *jt = cJSON_GetObjectItemCaseSensitive(s, "title");
+                    if (!cJSON_IsString(jt))
+                        jt = cJSON_GetObjectItemCaseSensitive(s,
+                                                              "description");
+                    cJSON *ju = cJSON_GetObjectItemCaseSensitive(s, "url");
+                    if (cJSON_IsString(jn) && jn->valuestring)
+                        snprintf(e->name, sizeof(e->name), "%s",
+                                 jn->valuestring);
+                    if (cJSON_IsString(jt) && jt->valuestring)
+                        snprintf(e->title, sizeof(e->title), "%s",
+                                 jt->valuestring);
+                    if (cJSON_IsString(ju) && ju->valuestring &&
+                        strstr(ju->valuestring, "://")) {
+                        /* any addon media URL gets a playback attempt;
+                         * ffmpeg shows the error if it cannot open it */
+                        snprintf(e->url, sizeof(e->url), "%s",
+                                 ju->valuestring);
+                        e->playable = 1;
+                    } else {
+                        /* infoHash-only torrent rows: nothing to open */
+                        e->playable = 0;
+                        if (!e->name[0])
+                            snprintf(e->name, sizeof(e->name),
+                                     "TORRENT - NEEDS DEBRID KEY IN ADDON");
+                    }
+                    if (!e->name[0] && !e->title[0]) continue;
+                    /* tag with the addon name so mixed results stay
+                     * attributable */
+                    {
+                        char an[96], tagged[160];
+                        pp_str_sanitize(addons[i].name, an, sizeof(an));
+                        snprintf(tagged, sizeof(tagged), "%s - %s",
+                                 an, e->name[0] ? e->name : "STREAM");
+                        snprintf(e->name, sizeof(e->name), "%s", tagged);
+                    }
+                    count++;
+                }
+            }
+            if (root) cJSON_Delete(root);
+            free(json);
         }
     }
 
-    /* action keys */
-    const int keys_y = grid_y + OSK_CHAR_ROW_COUNT * (cell_h + 12) + 14;
-    const int key_w = 300;
-    const int key_gap = 22;
-    int keys_total_w = OSK_KEY_COUNT * key_w + (OSK_KEY_COUNT - 1) * key_gap;
-    int keys_x = (1920 - keys_total_w) / 2;
+    pthread_mutex_lock(&g_str_mtx);
+    if (count > 0) {
+        memcpy(g_str_streams, tmp, sizeof(pp_str_stream) * (size_t)count);
+        g_str_stream_count = count;
+        g_str_stm_sel = 0;
+        g_str_stm_scrl = 0;
+        g_str_stm_status = 2;
+        snprintf(g_str_stm_msg, sizeof(g_str_stm_msg),
+                 "%d SOURCE%s FROM %d ADDON%s", count, count == 1 ? "" : "S",
+                 queried, queried == 1 ? "" : "S");
+    } else {
+        g_str_stream_count = 0;
+        g_str_stm_status = 3;
+        snprintf(g_str_stm_msg, sizeof(g_str_stm_msg), "%s",
+                 queried == 0 ? "NO STREAM ADDON INSTALLED"
+                              : (tmp ? "NO STREAMS FOUND" : "OUT OF MEMORY"));
+    }
+    pthread_mutex_unlock(&g_str_mtx);
+    free(tmp);
+    return NULL;
+}
 
-    for (int k = 0; k < OSK_KEY_COUNT; k++) {
-        int x = keys_x + k * (key_w + key_gap);
-        int sel = (g_osk_row == OSK_CHAR_ROW_COUNT && g_osk_col == k);
+static void pp_str_open_streams(const char *type, const char *id) {
+    if (g_str_stm_status == 1) return;
+    snprintf(g_str_stm_type, sizeof(g_str_stm_type), "%s", type);
+    snprintf(g_str_stm_id, sizeof(g_str_stm_id), "%s", id);
+    g_str_stream_count = 0;
+    g_str_stm_sel = 0;
+    g_str_stm_scrl = 0;
+    g_str_stm_status = 1;
+    snprintf(g_str_stm_msg, sizeof(g_str_stm_msg), "LOADING...");
 
-        if (sel) {
-            ui_round_asset(fb, x, keys_y, key_w, 72, 10,
-                           RR_BGRA(147,147,147,210),
-                           RR_BGRA(205,205,205,235),
-                           RR_BGRA(205,205,205,60));
+    pthread_t t;
+    if (pthread_create(&t, NULL, pp_str_streams_worker, NULL) == 0) {
+        pthread_detach(t);
+        screen = SCREEN_STREAMING_STREAMS;
+    } else {
+        g_str_stm_status = 3;
+        snprintf(g_str_stm_msg, sizeof(g_str_stm_msg), "THREAD FAILED");
+    }
+}
+
+/* ------------------------------ posters ------------------------------ */
+
+static uint32_t pp_str_hash_url(const char *s) {
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
+    return h;
+}
+
+static void *pp_str_poster_worker(void *arg) {
+    (void)arg;
+    char url[600];
+    pthread_mutex_lock(&g_str_mtx);
+    snprintf(url, sizeof(url), "%s", g_str_poster_req);
+    g_str_poster_req[0] = 0;
+    pthread_mutex_unlock(&g_str_mtx);
+    if (!url[0]) return NULL;
+
+    int w = 0, h = 0, ch = 0;
+    unsigned char *img = NULL;
+
+    /* disk cache first */
+    char path[160];
+    snprintf(path, sizeof(path), "%s/%08lx", PP_STR_POSTER_DIR,
+             (unsigned long)pp_str_hash_url(url));
+    FILE *fp = fopen(path, "rb");
+    if (fp) {
+        fseek(fp, 0, SEEK_END);
+        long sz = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        if (sz > 100 && sz < PP_STR_POSTER_CAP) {
+            unsigned char *buf = malloc((size_t)sz);
+            if (buf && fread(buf, 1, (size_t)sz, fp) == (size_t)sz)
+                img = stbi_load_from_memory(buf, (int)sz, &w, &h, &ch, 4);
+            free(buf);
+        }
+        fclose(fp);
+    }
+
+    if (!img) {
+        char *buf = malloc(PP_STR_POSTER_CAP);
+        if (buf) {
+            int n = pp_web_fetch(url, buf, PP_STR_POSTER_CAP);
+            if (n > 100)
+                img = stbi_load_from_memory((unsigned char *)buf, n,
+                                            &w, &h, &ch, 4);
+            if (img) {
+                mkdir("/data/PS Play", 0777);
+                mkdir(PP_STR_POSTER_DIR, 0777);
+                FILE *out = fopen(path, "wb");
+                if (out) { fwrite(buf, 1, (size_t)n, out); fclose(out); }
+            }
+            free(buf);
+        }
+    }
+
+    if (!img || w <= 0 || h <= 0) {
+        if (img) stbi_image_free(img);
+        pthread_mutex_lock(&g_str_mtx);
+        if (strcmp(g_str_poster_url, url) == 0)
+            g_str_poster_status = 3;
+        pthread_mutex_unlock(&g_str_mtx);
+        return NULL;
+    }
+
+    /* bound the decoded size (400x600 max, keep aspect) */
+    double sc = 1.0;
+    if (w > 400) sc = 400.0 / (double)w;
+    if (h * sc > 600) sc = 600.0 / (double)h;
+    int nw = (int)(w * sc); if (nw < 1) nw = 1;
+    int nh = (int)(h * sc); if (nh < 1) nh = 1;
+
+    unsigned int *px = malloc((size_t)nw * (size_t)nh * sizeof(unsigned int));
+    if (!px) {
+        stbi_image_free(img);
+        pthread_mutex_lock(&g_str_mtx);
+        if (strcmp(g_str_poster_url, url) == 0)
+            g_str_poster_status = 3;
+        pthread_mutex_unlock(&g_str_mtx);
+        return NULL;
+    }
+    for (int yy = 0; yy < nh; yy++) {
+        int sy = yy * h / nh;
+        for (int xx = 0; xx < nw; xx++) {
+            int sx = xx * w / nw;
+            unsigned char *p = img + ((size_t)sy * (size_t)w + sx) * 4;
+            px[(size_t)yy * nw + xx] =
+                RR_BGRA(p[0], p[1], p[2], p[3]);
+        }
+    }
+    stbi_image_free(img);
+
+    pthread_mutex_lock(&g_str_mtx);
+    if (g_str_poster_px) free(g_str_poster_px);
+    g_str_poster_px = px;
+    g_str_poster_w = nw;
+    g_str_poster_h = nh;
+    snprintf(g_str_poster_url, sizeof(g_str_poster_url), "%s", url);
+    g_str_poster_status = 2;
+    pthread_mutex_unlock(&g_str_mtx);
+    return NULL;
+}
+
+static void pp_str_poster_request(const char *url) {
+    if (!url || !url[0]) {
+        pthread_mutex_lock(&g_str_mtx);
+        g_str_poster_status = 0;
+        g_str_poster_url[0] = 0;
+        pthread_mutex_unlock(&g_str_mtx);
+        return;
+    }
+    pthread_mutex_lock(&g_str_mtx);
+    if (strcmp(g_str_poster_url, url) == 0 &&
+        (g_str_poster_status == 1 || g_str_poster_status == 2)) {
+        pthread_mutex_unlock(&g_str_mtx);
+        return;
+    }
+    if (g_str_poster_req[0] && strcmp(g_str_poster_req, url) == 0) {
+        pthread_mutex_unlock(&g_str_mtx);
+        return;
+    }
+    snprintf(g_str_poster_req, sizeof(g_str_poster_req), "%s", url);
+    snprintf(g_str_poster_url, sizeof(g_str_poster_url), "%s", url);
+    g_str_poster_status = 1;
+    pthread_mutex_unlock(&g_str_mtx);
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, pp_str_poster_worker, NULL) == 0) {
+        pthread_detach(t);
+    } else {
+        g_str_poster_status = 3;
+    }
+}
+
+static void pp_str_poster_draw(uint32_t *fb, int x, int y, int dw, int dh) {
+    rr_fill_round(fb, x - 2, y - 2, dw + 4, dh + 4, 20,
+                  RR_BGRA(255, 255, 255, 26));
+    rr_fill_round(fb, x, y, dw, dh, 18, RR_BGRA(14, 15, 18, 235));
+
+    pthread_mutex_lock(&g_str_mtx);
+    int status = g_str_poster_status;
+    unsigned int *px = g_str_poster_px;
+    int sw = g_str_poster_w, sh = g_str_poster_h;
+    if (status == 2 && px && sw > 0 && sh > 0) {
+        for (int yy = 0; yy < dh; yy++) {
+            int fy = y + yy;
+            if ((unsigned)fy >= 1080) continue;
+            int sy = yy * sh / dh;
+            for (int xx = 0; xx < dw; xx++) {
+                int fx = x + xx;
+                if ((unsigned)fx >= 1920) continue;
+                int sx = xx * sw / dw;
+                fb[fy * 1920 + fx] =
+                    rr_blend(fb[fy * 1920 + fx], px[(size_t)sy * sw + sx]);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_str_mtx);
+
+    if (status == 1)
+        rr_text_center(fb, x + dw / 2, y + dh / 2, "LOADING",
+                       RR_BGRA(203, 203, 203, 220), 1);
+    else if (status != 2)
+        rr_text_center(fb, x + dw / 2, y + dh / 2, "NO POSTER",
+                       RR_BGRA(150, 150, 150, 200), 1);
+}
+
+/* ------------------------------ screens ------------------------------ */
+
+static void prospero_streaming_enter(void) {
+    pp_str_addons_load();
+    pp_str_usb_auto();
+    g_str_hub_sel = 0;
+    g_str_hub_scrl = 0;
+    screen = SCREEN_STREAMING_HOME;
+}
+
+void draw_streaming_home_screen(uint32_t *fb) {
+    static int frame = 0;
+    frame++;
+    pp_str_addons_load();
+
+    pp_net_draw_header(fb, "STREMIO",
+                       "MOVIES AND SERIES FROM STREMIO ADDONS", frame);
+
+    char status[192];
+    if (g_str_import_status == 1 || g_str_import_msg[0]) {
+        snprintf(status, sizeof(status), "%s", g_str_import_msg);
+    } else {
+        snprintf(status, sizeof(status), "%d ADDON%s INSTALLED",
+                 g_str_addon_count, g_str_addon_count == 1 ? "" : "S");
+    }
+    pp_net_draw_status_line(fb, status);
+
+    static pp_net_list_row rows[3];
+
+    snprintf(rows[0].title, sizeof(rows[0].title), "MOVIES");
+    snprintf(rows[0].detail, sizeof(rows[0].detail),
+             "BROWSE THE MOVIE CATALOG - TRIANGLE TO SEARCH");
+    rows[0].icon = 1;
+
+    snprintf(rows[1].title, sizeof(rows[1].title), "SERIES");
+    snprintf(rows[1].detail, sizeof(rows[1].detail),
+             "BROWSE THE TV SERIES CATALOG - TRIANGLE TO SEARCH");
+    rows[1].icon = 6;
+
+    snprintf(rows[2].title, sizeof(rows[2].title), "SETTINGS");
+    snprintf(rows[2].detail, sizeof(rows[2].detail),
+             "ADD ADDONS - LOAD FROM USB FILE - ADDON LIST");
+    rows[2].icon = 5;
+
+    pp_net_draw_rows(fb, rows, 3, g_str_hub_sel, &g_str_hub_scrl, frame);
+    pp_net_draw_footer3(fb, "OPEN", "", "BACK");
+}
+
+void draw_streaming_settings_screen(uint32_t *fb) {
+    static int frame = 0;
+    frame++;
+
+    pp_net_draw_header(fb, "STREMIO SETTINGS",
+                       "MANAGE ADDONS - USB FILE IS " "PS PLAY/STREMIO_ADDONS.TXT",
+                       frame);
+    pp_net_draw_status_line(fb, g_str_add_msg[0] ? g_str_add_msg
+                                                 : g_str_import_msg);
+
+    static pp_net_list_row rows[3];
+
+    snprintf(rows[0].title, sizeof(rows[0].title), "ADD ADDON MANUALLY");
+    snprintf(rows[0].detail, sizeof(rows[0].detail),
+             "TYPE A STREMIO ADDON URL WITH THE SYSTEM KEYBOARD");
+    rows[0].icon = 7;
+
+    snprintf(rows[1].title, sizeof(rows[1].title), "LOAD ADDONS FROM TXT FILE");
+    snprintf(rows[1].detail, sizeof(rows[1].detail),
+             "USB0 - PS PLAY - STREMIO_ADDONS.TXT");
+    rows[1].icon = 0;
+
+    snprintf(rows[2].title, sizeof(rows[2].title), "ADDON LIST");
+    char ld[160];
+    snprintf(ld, sizeof(ld), "%d ADDON%s INSTALLED", g_str_addon_count,
+             g_str_addon_count == 1 ? "" : "S");
+    snprintf(rows[2].detail, sizeof(rows[2].detail), "%s", ld);
+    rows[2].icon = 5;
+
+    pp_net_draw_rows(fb, rows, 3, g_str_set_sel, &g_str_set_scrl, frame);
+    pp_net_draw_footer3(fb, "OPEN", "", "BACK");
+}
+
+void draw_streaming_addons_screen(uint32_t *fb) {
+    static int frame = 0;
+    frame++;
+
+    pp_net_draw_header(fb, "ADDON LIST",
+                       "X SETS ACTIVE FOR CATALOGS - SQUARE REMOVES", frame);
+
+    char status[96];
+    snprintf(status, sizeof(status), "%d INSTALLED", g_str_addon_count);
+    pp_net_draw_status_line(fb, status);
+
+    static pp_net_list_row rows[PP_STR_MAX_ADDONS];
+    for (int i = 0; i < g_str_addon_count; i++) {
+        char nm[96], host[300];
+        pp_str_sanitize(g_str_addons[i].name, nm, sizeof(nm));
+        pp_str_host_of(g_str_addons[i].base, host, sizeof(host));
+        int has_cat = g_str_addons[i].cat_movie[0] ||
+                      g_str_addons[i].cat_series[0];
+        snprintf(rows[i].title, sizeof(rows[0].title), "%s%s",
+                 nm, i == g_str_active ? "  -  ACTIVE" : "");
+        snprintf(rows[i].detail, sizeof(rows[0].detail), "%s  -  %s%s%s",
+                 host,
+                 has_cat ? "CATALOGS" : "",
+                 has_cat && g_str_addons[i].has_stream ? " + " : "",
+                 g_str_addons[i].has_stream ? "STREAMS" :
+                     (has_cat ? "" : "NO ENDPOINTS"));
+        rows[i].icon = 5;
+    }
+
+    pp_net_draw_rows(fb, rows, g_str_addon_count, g_str_alist_sel,
+                     &g_str_alist_scrl, frame);
+    pp_net_draw_footer3(fb, "SET ACTIVE", "REMOVE", "BACK");
+}
+
+void draw_streaming_catalog_screen(uint32_t *fb) {
+    static int frame = 0;
+    frame++;
+
+    char nm[96];
+    pp_str_sanitize(g_str_addons[g_str_active].name, nm, sizeof(nm));
+    char sub[160];
+    if (g_str_cat_query[0]) {
+        char q[80];
+        pp_str_sanitize(g_str_cat_query, q, sizeof(q));
+        snprintf(sub, sizeof(sub), "SEARCH  -  %s", q);
+    } else {
+        snprintf(sub, sizeof(sub), "%s  -  %s",
+                 strcmp(g_str_cat_type, "movie") == 0 ? "MOVIES" : "SERIES",
+                 nm);
+    }
+    pp_net_draw_header(fb, "STREMIO", sub, frame);
+    pp_net_draw_status_line(fb, g_str_cat_msg);
+
+    if (g_str_cat_status == 1) {
+        pp_net_draw_working(fb, frame, "LOADING CATALOG");
+    } else if (g_str_meta_count <= 0) {
+        rr_text(fb, 230, 330, "NO TITLES FOUND",
+                RR_BGRA(232, 244, 255, 230), 2);
+        rr_text(fb, 232, 382, g_str_cat_msg,
+                RR_BGRA(204, 204, 204, 215), 1);
+    } else {
+        static pp_net_list_row rows[PP_STR_MAX_METAS];
+        pthread_mutex_lock(&g_str_mtx);
+        for (int i = 0; i < g_str_meta_count; i++) {
+            pp_str_sanitize(g_str_metas[i].name, rows[i].title,
+                            sizeof(rows[i].title));
+            char yr[24];
+            pp_str_sanitize(g_str_metas[i].year, yr, sizeof(yr));
+            snprintf(rows[i].detail, sizeof(rows[i].detail), "%s%s%s",
+                     strcmp(g_str_metas[i].type, "series") == 0
+                         ? "SERIES" : "MOVIE",
+                     yr[0] ? "  -  " : "", yr);
+            rows[i].icon = 1;
+        }
+        int count = g_str_meta_count;
+        char poster[600];
+        int sel = g_str_cat_sel;
+        if (sel < 0) sel = 0;
+        if (sel >= count) sel = count - 1;
+        snprintf(poster, sizeof(poster), "%s", g_str_metas[sel].poster);
+        pthread_mutex_unlock(&g_str_mtx);
+
+        pp_net_draw_rows(fb, rows, count, sel, &g_str_cat_scrl, frame);
+
+        static int last_sel = -1;
+        if (sel != last_sel) {
+            last_sel = sel;
+            pp_str_poster_request(poster);
+        }
+        pp_str_poster_draw(fb, 1500, 300, 300, 450);
+    }
+
+    pp_net_draw_footer_xtc(fb, "OPEN", "SEARCH", "BACK");
+}
+
+void draw_streaming_detail_screen(uint32_t *fb) {
+    static int frame = 0;
+    frame++;
+
+    char nm[200];
+    pp_str_sanitize(g_str_cur.name, nm, sizeof(nm));
+    char sub[300];
+    char yr[24];
+    pp_str_sanitize(g_str_cur.year, yr, sizeof(yr));
+    snprintf(sub, sizeof(sub), "%s%s%s", nm, yr[0] ? "  -  " : "", yr);
+    if (strlen(sub) > 62) { sub[59] = '.'; sub[60] = '.'; sub[61] = 0; }
+    pp_net_draw_header(fb, "STREMIO", sub, frame);
+    pp_net_draw_status_line(fb, g_str_det_msg);
+
+    int is_series = strcmp(g_str_cur.type, "series") == 0;
+
+    if (g_str_det_status == 1) {
+        pp_net_draw_working(fb, frame, "LOADING DETAILS");
+    } else {
+        static pp_net_list_row rows[PP_STR_MAX_EPISODES];
+        int total;
+        pthread_mutex_lock(&g_str_mtx);
+        if (is_series && g_str_ep_count > 0) {
+            total = g_str_ep_count;
+            for (int i = 0; i < total; i++) {
+                if (g_str_eps[i].title[0])
+                    pp_str_sanitize(g_str_eps[i].title, rows[i].title,
+                                    sizeof(rows[i].title));
+                else
+                    snprintf(rows[i].title, sizeof(rows[i].title),
+                             "EPISODE %d", g_str_eps[i].episode);
+                snprintf(rows[i].detail, sizeof(rows[i].detail),
+                         "S%02d E%02d", g_str_eps[i].season,
+                         g_str_eps[i].episode);
+                rows[i].icon = 1;
+            }
         } else {
-            ui_round_asset(fb, x, keys_y, key_w, 72, 10,
-                           RR_BGRA(40,40,40,180),
-                           RR_BGRA(105,105,105,130), 0);
+            total = 1;
+            snprintf(rows[0].title, sizeof(rows[0].title), "WATCH");
+            if (g_str_desc[0])
+                pp_str_sanitize(g_str_desc, rows[0].detail,
+                                sizeof(rows[0].detail));
+            else
+                snprintf(rows[0].detail, sizeof(rows[0].detail),
+                         "FIND PLAYABLE SOURCES");
+            rows[0].icon = 1;
         }
+        pthread_mutex_unlock(&g_str_mtx);
 
-        int tw = (int)strlen(OSK_KEYS[k]) * 24;
-        rr_text(fb, x + (key_w - tw) / 2, keys_y + 20, OSK_KEYS[k],
-                sel ? RR_BGRA(255, 255, 255, 255)
-                    : RR_BGRA(232,232,232,225),
-                2);
+        pp_net_draw_rows(fb, rows, total, g_str_det_sel, &g_str_det_scrl,
+                         frame);
+
+        /* the detail worker can replace a missing catalog poster */
+        static char last_det_poster[600] = {0};
+        pthread_mutex_lock(&g_str_mtx);
+        char det_poster[600];
+        snprintf(det_poster, sizeof(det_poster), "%s", g_str_cur.poster);
+        pthread_mutex_unlock(&g_str_mtx);
+        if (strcmp(last_det_poster, det_poster) != 0) {
+            snprintf(last_det_poster, sizeof(last_det_poster), "%s",
+                     det_poster);
+            pp_str_poster_request(det_poster);
+        }
+        pp_str_poster_draw(fb, 1500, 300, 300, 450);
     }
 
-    pp_net_draw_footer3(fb, "TYPE", "SYSTEM KEYBOARD", "CANCEL");
+    pp_net_draw_footer3(fb, "SOURCES", "", "BACK");
+}
+
+void draw_streaming_streams_screen(uint32_t *fb) {
+    static int frame = 0;
+    frame++;
+
+    char nm[200];
+    pp_str_sanitize(g_str_cur.name, nm, sizeof(nm));
+    if (strlen(nm) > 62) { nm[59] = '.'; nm[60] = '.'; nm[61] = 0; }
+    pp_net_draw_header(fb, "SOURCES", nm, frame);
+    pp_net_draw_status_line(fb, g_str_stm_msg);
+
+    if (g_str_stm_status == 1) {
+        pp_net_draw_working(fb, frame, "ASKING ADDONS FOR STREAMS");
+    } else if (g_str_stream_count <= 0) {
+        rr_text(fb, 230, 330, "NO STREAMS FOUND",
+                RR_BGRA(232, 244, 255, 230), 2);
+        rr_text(fb, 232, 382, "ADD STREAM ADDONS FROM STREMIO SETTINGS",
+                RR_BGRA(204, 204, 204, 215), 1);
+    } else {
+        static pp_net_list_row rows[PP_STR_MAX_STREAMS];
+        pthread_mutex_lock(&g_str_mtx);
+        for (int i = 0; i < g_str_stream_count; i++) {
+            pp_str_sanitize(g_str_streams[i].name, rows[i].title,
+                            sizeof(rows[i].title));
+            if (!rows[i].title[0])
+                snprintf(rows[i].title, sizeof(rows[i].title), "STREAM");
+            if (g_str_streams[i].playable) {
+                pp_str_sanitize(g_str_streams[i].title, rows[i].detail,
+                                sizeof(rows[i].detail));
+                if (!rows[i].detail[0])
+                    snprintf(rows[i].detail, sizeof(rows[i].detail),
+                             "HTTP STREAM");
+            } else {
+                snprintf(rows[i].detail, sizeof(rows[i].detail),
+                         "TORRENT - NOT SUPPORTED YET");
+            }
+            rows[i].icon = g_str_streams[i].playable ? 1 : 4;
+        }
+        pthread_mutex_unlock(&g_str_mtx);
+
+        pp_net_draw_rows(fb, rows, g_str_stream_count, g_str_stm_sel,
+                         &g_str_stm_scrl, frame);
+        pp_str_poster_draw(fb, 1500, 300, 300, 450);
+    }
+
+    pp_net_draw_footer3(fb, "PLAY", "", "BACK");
 }
 
 /* ------------------------------------------------------------------ */
 /* Input handling for all network screens                              */
 /* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* DLNA hub — one entry for the receiver and the server browser        */
+/* ------------------------------------------------------------------ */
+
+static int g_dlna_hub_sel = 0;
+static int g_dlna_hub_scrl = 0;
+
+void draw_dlna_hub_screen(uint32_t *fb) {
+    static int frame = 0;
+    frame++;
+
+    pp_net_draw_header(fb, "DLNA",
+                       "CAST RECEIVER AND NETWORK MEDIA SERVERS", frame);
+
+    pp_dmr_status st;
+    pp_dmr_get_status(&st);
+
+    char status[160];
+    if (st.running) {
+        snprintf(status, sizeof(status), "RECEIVER ACTIVE  -  %s:%d",
+                 st.ip, st.port);
+    } else {
+        snprintf(status, sizeof(status), "RECEIVER OFF");
+    }
+    pp_net_draw_status_line(fb, status);
+
+    static pp_net_list_row rows[2];
+    snprintf(rows[0].title, sizeof(rows[0].title), "DLNA RECEIVER");
+    snprintf(rows[0].detail, sizeof(rows[0].detail),
+             "CAST TO THIS CONSOLE - STATUS AND HOW TO CAST");
+    rows[0].icon = 6; /* tv */
+
+    snprintf(rows[1].title, sizeof(rows[1].title), "BROWSE MEDIA SERVERS");
+    snprintf(rows[1].detail, sizeof(rows[1].detail),
+             "STREAM FROM DLNA / UPNP SERVERS ON YOUR NETWORK");
+    rows[1].icon = 5; /* server */
+
+    pp_net_draw_rows(fb, rows, 2, g_dlna_hub_sel, &g_dlna_hub_scrl, frame);
+
+    pp_net_draw_footer3(fb, "OPEN", "", "BACK");
+}
 
 void draw_dmr_screen(uint32_t *fb) {
     static int frame = 0;
@@ -18375,7 +21258,7 @@ void draw_dmr_screen(uint32_t *fb) {
     /* Instructions */
     rr_text(fb, 230, 760, "HOW TO CAST", RR_BGRA(204,204,204,215), 1);
     rr_text(fb, 230, 796,
-            "BUBBLEUPNP: DEVICES -> PROSPEROPLAYER PS5 -> PLAY MEDIA",
+            "BUBBLEUPNP: DEVICES -> PS PLAY -> PLAY MEDIA",
             RR_BGRA(230,230,230,220), 1);
     rr_text(fb, 230, 836,
             "THE CONSOLE PLAYS VIDEO AND AUDIO LIKE A CHROMECAST",
@@ -18386,6 +21269,61 @@ void draw_dmr_screen(uint32_t *fb) {
 
 static void prospero_net_handle_input(uint32_t pressed) {
     if (!pressed) return;
+
+    /* "Watch in PS Play?" prompt swallows all input while visible */
+    if (g_media_prompt) {
+        if (pressed & PS5_PAD_BUTTON_CROSS) {
+            g_media_prompt = 0;
+            prospero_network_play(g_media_prompt_url, "WEB MEDIA");
+        } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+            g_media_prompt = 0;
+            prospero_web_launch(g_media_prompt_url);
+        }
+        return;
+    }
+
+    if (screen == SCREEN_WEB_MEDIA) {
+        if (g_web_media_state == 1) {
+            /* scan running: only allow leaving the screen */
+            if (pressed & PS5_PAD_BUTTON_CIRCLE)
+                screen = SCREEN_WEB_BROWSER;
+            return;
+        }
+        int total = g_web_media_count;
+        if (total > 0 && (pressed & PS5_PAD_BUTTON_DOWN)) {
+            g_web_media_sel = (g_web_media_sel + 1) % total;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_UP)) {
+            g_web_media_sel = (g_web_media_sel + total - 1) % total;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_RIGHT)) {
+            g_web_media_sel += PP_NET_LIST_VISIBLE;
+            if (g_web_media_sel >= total) g_web_media_sel = total - 1;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_LEFT)) {
+            g_web_media_sel -= PP_NET_LIST_VISIBLE;
+            if (g_web_media_sel < 0) g_web_media_sel = 0;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_CROSS)) {
+            prospero_network_play(g_web_media_urls[g_web_media_sel],
+                                  "WEB MEDIA");
+        } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+            screen = SCREEN_WEB_BROWSER;
+        }
+        return;
+    }
+
+    if (screen == SCREEN_DLNA_HUB) {
+        if (pressed & (PS5_PAD_BUTTON_DOWN | PS5_PAD_BUTTON_UP)) {
+            g_dlna_hub_sel = g_dlna_hub_sel == 0 ? 1 : 0;
+        } else if (pressed & PS5_PAD_BUTTON_CROSS) {
+            if (g_dlna_hub_sel == 0) {
+                screen = SCREEN_DMR;
+            } else {
+                prospero_net_enter_dlna();
+                screen = SCREEN_DLNA_SERVERS;
+            }
+        } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+            screen = 0;
+        }
+        return;
+    }
 
     if (screen == SCREEN_DLNA_SERVERS) {
         if (pressed & PS5_PAD_BUTTON_DOWN) {
@@ -18413,7 +21351,7 @@ static void prospero_net_handle_input(uint32_t pressed) {
         } else if (pressed & PS5_PAD_BUTTON_SQUARE) {
             dlna_start_discover();
         } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
-            screen = 0;
+            screen = SCREEN_DLNA_HUB;
         }
         return;
     }
@@ -18463,37 +21401,130 @@ static void prospero_net_handle_input(uint32_t pressed) {
     }
 
     if (screen == SCREEN_IPTV) {
-        int total = g_iptv_count + 1;
+        const int total = 3;
         if (pressed & PS5_PAD_BUTTON_DOWN) {
             g_iptv_sel = (g_iptv_sel + 1) % total;
         } else if (pressed & PS5_PAD_BUTTON_UP) {
             g_iptv_sel = (g_iptv_sel + total - 1) % total;
-        } else if (pressed & PS5_PAD_BUTTON_RIGHT) {
-            g_iptv_sel += PP_NET_LIST_VISIBLE;
-            if (g_iptv_sel >= total) g_iptv_sel = total - 1;
-        } else if (pressed & PS5_PAD_BUTTON_LEFT) {
-            g_iptv_sel -= PP_NET_LIST_VISIBLE;
-            if (g_iptv_sel < 0) g_iptv_sel = 0;
         } else if (pressed & PS5_PAD_BUTTON_CROSS) {
             if (g_iptv_sel == 0) {
+                /* dedicated channel list page */
+                pp_iptv_view_rebuild();
+                g_iptv_ch_sel = 0;
+                g_iptv_ch_scrl = 0;
+                screen = SCREEN_IPTV_CHANNELS;
+            } else if (g_iptv_sel == 1) {
                 /* custom URL entry */
-                g_osk_row = 0;
-                g_osk_col = 0;
                 if (g_osk_len == 0) {
                     snprintf(g_osk_buf, sizeof(g_osk_buf), "http://");
                     g_osk_len = 7;
                 }
                 g_osk_ime_pending = 1;
                 screen = SCREEN_URL_ENTRY;
-            } else if (g_iptv_sel - 1 < g_iptv_count) {
-                pp_iptv_channel *c = &g_iptv[g_iptv_sel - 1];
+            } else if (g_iptv_sel == 2) {
+                /* pick a specific M3U playlist file from USB / data */
+                prospero_iptv_enter_m3u_picker();
+            }
+        } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+            screen = 0;
+        }
+        return;
+    }
+
+    if (screen == SCREEN_IPTV_CHANNELS) {
+        int total = g_iptv_view_count;
+        if (total > 0 && (pressed & PS5_PAD_BUTTON_DOWN)) {
+            g_iptv_ch_sel = (g_iptv_ch_sel + 1) % total;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_UP)) {
+            g_iptv_ch_sel = (g_iptv_ch_sel + total - 1) % total;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_RIGHT)) {
+            g_iptv_ch_sel += PP_NET_LIST_VISIBLE;
+            if (g_iptv_ch_sel >= total) g_iptv_ch_sel = total - 1;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_LEFT)) {
+            g_iptv_ch_sel -= PP_NET_LIST_VISIBLE;
+            if (g_iptv_ch_sel < 0) g_iptv_ch_sel = 0;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_CROSS)) {
+            if (g_iptv_ch_sel < g_iptv_view_count) {
+                pp_iptv_channel *c = &g_iptv[g_iptv_view[g_iptv_ch_sel]];
                 prospero_network_play(c->url, c->name);
+            }
+        } else if (pressed & PS5_PAD_BUTTON_TRIANGLE) {
+            /* search channels by name / group; empty text clears filter */
+            int users[4] = {0};
+            sceUserServiceGetLoginUserIdList(users);
+            char buf[160] = {0};
+            snprintf(buf, sizeof(buf), "%s", g_iptv_filter);
+            int rc = pp_ime_get_text(users[0], 0, buf, "PS PLAY - SEARCH",
+                                     buf, sizeof(buf));
+            if (rc == 0) {
+                snprintf(g_iptv_filter, sizeof(g_iptv_filter), "%s", buf);
+                pp_iptv_view_rebuild();
+                g_iptv_ch_sel = 0;
+                g_iptv_ch_scrl = 0;
+            } else if (rc == -1) {
+                toast("KEYBOARD", "SYSTEM KEYBOARD UNAVAILABLE");
             }
         } else if (pressed & PS5_PAD_BUTTON_SQUARE) {
             g_iptv_count = pp_iptv_load(g_iptv, PP_NET_MAX_IPTV);
             g_iptv_loaded = 1;
-            if (g_iptv_sel > g_iptv_count) g_iptv_sel = g_iptv_count;
-            toast("IPTV", "PLAYLISTS RELOADED FROM USB");
+            pp_iptv_view_rebuild();
+            toast("IPTV", "PLAYLISTS RELOADED");
+        } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+            screen = SCREEN_IPTV;
+            g_iptv_sel = 0;
+        }
+        return;
+    }
+
+    if (screen == SCREEN_IPTV_M3U) {
+        if (pressed & PS5_PAD_BUTTON_DOWN) {
+            if (g_m3u_pick_count > 0)
+                g_m3u_pick_sel = (g_m3u_pick_sel + 1) % g_m3u_pick_count;
+        } else if (pressed & PS5_PAD_BUTTON_UP) {
+            if (g_m3u_pick_count > 0)
+                g_m3u_pick_sel = (g_m3u_pick_sel + g_m3u_pick_count - 1) %
+                                 g_m3u_pick_count;
+        } else if (pressed & PS5_PAD_BUTTON_RIGHT) {
+            g_m3u_pick_sel += PP_NET_LIST_VISIBLE;
+            if (g_m3u_pick_sel >= g_m3u_pick_count)
+                g_m3u_pick_sel = g_m3u_pick_count > 0 ? g_m3u_pick_count - 1 : 0;
+        } else if (pressed & PS5_PAD_BUTTON_LEFT) {
+            g_m3u_pick_sel -= PP_NET_LIST_VISIBLE;
+            if (g_m3u_pick_sel < 0) g_m3u_pick_sel = 0;
+        } else if (pressed & PS5_PAD_BUTTON_CROSS) {
+            prospero_iptv_load_picked_m3u(g_m3u_pick_sel);
+        } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+            screen = SCREEN_IPTV;
+        }
+        return;
+    }
+
+    if (screen == SCREEN_WEB_BROWSER) {
+        int total = 3 + g_web_history_count;
+        if (pressed & PS5_PAD_BUTTON_DOWN) {
+            g_web_sel = (g_web_sel + 1) % total;
+        } else if (pressed & PS5_PAD_BUTTON_UP) {
+            g_web_sel = (g_web_sel + total - 1) % total;
+        } else if (pressed & PS5_PAD_BUTTON_RIGHT) {
+            g_web_sel += PP_NET_LIST_VISIBLE;
+            if (g_web_sel >= total) g_web_sel = total - 1;
+        } else if (pressed & PS5_PAD_BUTTON_LEFT) {
+            g_web_sel -= PP_NET_LIST_VISIBLE;
+            if (g_web_sel < 0) g_web_sel = 0;
+        } else if (pressed & PS5_PAD_BUTTON_CROSS) {
+            if (g_web_sel == 0) {
+                prospero_web_enter_url();
+            } else if (g_web_sel == 1) {
+                prospero_web_scan_page();
+            } else if (g_web_sel == 2) {
+                prospero_web_launch("https://www.youtube.com");
+            } else if (g_web_sel - 3 < g_web_history_count) {
+                const char *u = g_web_history[g_web_sel - 3];
+                if (pp_url_is_media(u))
+                    prospero_web_offer_media(u);
+                else
+                    prospero_web_launch(u);
+            }
         } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
             screen = 0;
         }
@@ -18536,7 +21567,225 @@ static void prospero_net_handle_input(uint32_t pressed) {
             pp_dmr_report_stopped();
             toast("DLNA CAST", "Cast stopped");
         } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+            screen = SCREEN_DLNA_HUB;
+        }
+        return;
+    }
+
+    if (screen == SCREEN_STREAMING_HOME) {
+        pp_str_addons_load();
+        if (pressed & PS5_PAD_BUTTON_DOWN) {
+            g_str_hub_sel = (g_str_hub_sel + 1) % 3;
+        } else if (pressed & PS5_PAD_BUTTON_UP) {
+            g_str_hub_sel = (g_str_hub_sel + 2) % 3;
+        } else if (pressed & PS5_PAD_BUTTON_CROSS) {
+            if (g_str_hub_sel == 0) {
+                g_str_cat_query[0] = 0;
+                pp_str_open_catalog("movie");
+            } else if (g_str_hub_sel == 1) {
+                g_str_cat_query[0] = 0;
+                pp_str_open_catalog("series");
+            } else {
+                g_str_set_sel = 0;
+                g_str_set_scrl = 0;
+                screen = SCREEN_STREAMING_SETTINGS;
+            }
+        } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
             screen = 0;
+        }
+        return;
+    }
+
+    if (screen == SCREEN_STREAMING_SETTINGS) {
+        if (pressed & PS5_PAD_BUTTON_DOWN) {
+            g_str_set_sel = (g_str_set_sel + 1) % 3;
+        } else if (pressed & PS5_PAD_BUTTON_UP) {
+            g_str_set_sel = (g_str_set_sel + 2) % 3;
+        } else if (pressed & PS5_PAD_BUTTON_CROSS) {
+            if (g_str_set_sel == 0) {
+                /* manual add via system keyboard */
+                int users[4] = {0};
+                sceUserServiceGetLoginUserIdList(users);
+                char buf[512];
+                snprintf(buf, sizeof(buf), "https://");
+                int rc = pp_ime_get_text(users[0], 1, buf,
+                                         "PS PLAY - STREMIO ADDON",
+                                         buf, sizeof(buf));
+                if (rc == 0) {
+                    if (strncmp(buf, "http://", 7) == 0 ||
+                        strncmp(buf, "https://", 8) == 0 ||
+                        strchr(buf, '.')) {
+                        pp_str_add_begin(buf);
+                        snprintf(g_str_import_msg,
+                                 sizeof(g_str_import_msg), "%s",
+                                 "CHECKING ADDON...");
+                    } else {
+                        toast("INVALID URL", "ENTER AN ADDON ADDRESS");
+                    }
+                } else if (rc == -1) {
+                    toast("KEYBOARD", "SYSTEM KEYBOARD UNAVAILABLE");
+                }
+            } else if (g_str_set_sel == 1) {
+                pp_str_usb_ensure();
+                pp_str_usb_import_start();
+            } else {
+                g_str_alist_sel = 0;
+                g_str_alist_scrl = 0;
+                screen = SCREEN_STREAMING_ADDONS;
+            }
+        } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+            screen = SCREEN_STREAMING_HOME;
+        }
+        return;
+    }
+
+    if (screen == SCREEN_STREAMING_ADDONS) {
+        int total = g_str_addon_count;
+        if (total > 0 && (pressed & PS5_PAD_BUTTON_DOWN)) {
+            g_str_alist_sel = (g_str_alist_sel + 1) % total;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_UP)) {
+            g_str_alist_sel = (g_str_alist_sel + total - 1) % total;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_CROSS)) {
+            if (g_str_alist_sel < total &&
+                g_str_alist_sel != g_str_active) {
+                g_str_active = g_str_alist_sel;
+                char nm[96];
+                pp_str_sanitize(g_str_addons[g_str_active].name,
+                                nm, sizeof(nm));
+                toast("STREMIO", nm);
+            }
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_SQUARE)) {
+            int idx = g_str_alist_sel;
+            if (idx > 0 && idx < g_str_addon_count &&
+                !g_str_addons[idx].builtin) {
+                for (int k = idx; k + 1 < g_str_addon_count; k++)
+                    memcpy(&g_str_addons[k], &g_str_addons[k + 1],
+                           sizeof(pp_str_addon));
+                g_str_addon_count--;
+                if (g_str_active >= g_str_addon_count ||
+                    g_str_active == idx)
+                    g_str_active = 0;
+                else if (g_str_active > idx)
+                    g_str_active--;
+                pp_str_addons_save();
+                if (g_str_alist_sel >= g_str_addon_count)
+                    g_str_alist_sel = g_str_addon_count - 1;
+                toast("STREMIO", "ADDON REMOVED");
+            }
+        } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+            screen = SCREEN_STREAMING_SETTINGS;
+        }
+        return;
+    }
+
+    if (screen == SCREEN_STREAMING_CATALOG) {
+        if (g_str_cat_status == 1) {
+            if (pressed & PS5_PAD_BUTTON_CIRCLE)
+                screen = SCREEN_STREAMING_HOME;
+            return;
+        }
+        int total = g_str_meta_count;
+        if (total > 0 && (pressed & PS5_PAD_BUTTON_DOWN)) {
+            g_str_cat_sel = (g_str_cat_sel + 1) % total;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_UP)) {
+            g_str_cat_sel = (g_str_cat_sel + total - 1) % total;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_RIGHT)) {
+            g_str_cat_sel += PP_NET_LIST_VISIBLE;
+            if (g_str_cat_sel >= total) g_str_cat_sel = total - 1;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_LEFT)) {
+            g_str_cat_sel -= PP_NET_LIST_VISIBLE;
+            if (g_str_cat_sel < 0) g_str_cat_sel = 0;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_CROSS)) {
+            if (g_str_cat_sel < g_str_meta_count)
+                pp_str_open_detail(g_str_cat_sel);
+        } else if (pressed & PS5_PAD_BUTTON_TRIANGLE) {
+            /* search inside the current catalog (Stremio search extra) */
+            int users[4] = {0};
+            sceUserServiceGetLoginUserIdList(users);
+            char buf[256] = {0};
+            int rc = pp_ime_get_text(users[0], 0, buf, "PS PLAY - SEARCH",
+                                     buf, sizeof(buf));
+            if (rc == 0 && buf[0]) {
+                pp_str_urlencode(buf, g_str_cat_query,
+                                 sizeof(g_str_cat_query));
+                pp_str_open_catalog(g_str_cat_type);
+            } else if (rc == -1) {
+                toast("KEYBOARD", "SYSTEM KEYBOARD UNAVAILABLE");
+            }
+        } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+            screen = SCREEN_STREAMING_HOME;
+        }
+        return;
+    }
+
+    if (screen == SCREEN_STREAMING_DETAIL) {
+        if (g_str_det_status == 1) {
+            if (pressed & PS5_PAD_BUTTON_CIRCLE)
+                screen = SCREEN_STREAMING_CATALOG;
+            return;
+        }
+        int is_series = strcmp(g_str_cur.type, "series") == 0;
+        int total = (is_series && g_str_ep_count > 0) ? g_str_ep_count : 1;
+        if (pressed & PS5_PAD_BUTTON_DOWN) {
+            g_str_det_sel = (g_str_det_sel + 1) % total;
+        } else if (pressed & PS5_PAD_BUTTON_UP) {
+            g_str_det_sel = (g_str_det_sel + total - 1) % total;
+        } else if (pressed & PS5_PAD_BUTTON_RIGHT) {
+            g_str_det_sel += PP_NET_LIST_VISIBLE;
+            if (g_str_det_sel >= total) g_str_det_sel = total - 1;
+        } else if (pressed & PS5_PAD_BUTTON_LEFT) {
+            g_str_det_sel -= PP_NET_LIST_VISIBLE;
+            if (g_str_det_sel < 0) g_str_det_sel = 0;
+        } else if (pressed & PS5_PAD_BUTTON_CROSS) {
+            if (is_series && g_str_ep_count > 0 &&
+                g_str_det_sel < g_str_ep_count) {
+                pp_str_open_streams("series", g_str_eps[g_str_det_sel].id);
+            } else {
+                /* prefer the imdb (tt) id: tmdb:/kitsu: catalog ids are
+                 * ignored by most stream addons */
+                const char *sid = g_str_cur.alt_id[0] ? g_str_cur.alt_id
+                                                      : g_str_cur.id;
+                if (sid[0])
+                    pp_str_open_streams(g_str_cur.type, sid);
+            }
+        } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+            screen = SCREEN_STREAMING_CATALOG;
+        }
+        return;
+    }
+
+    if (screen == SCREEN_STREAMING_STREAMS) {
+        if (g_str_stm_status == 1) {
+            if (pressed & PS5_PAD_BUTTON_CIRCLE)
+                screen = SCREEN_STREAMING_DETAIL;
+            return;
+        }
+        int total = g_str_stream_count;
+        if (total > 0 && (pressed & PS5_PAD_BUTTON_DOWN)) {
+            g_str_stm_sel = (g_str_stm_sel + 1) % total;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_UP)) {
+            g_str_stm_sel = (g_str_stm_sel + total - 1) % total;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_RIGHT)) {
+            g_str_stm_sel += PP_NET_LIST_VISIBLE;
+            if (g_str_stm_sel >= total) g_str_stm_sel = total - 1;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_LEFT)) {
+            g_str_stm_sel -= PP_NET_LIST_VISIBLE;
+            if (g_str_stm_sel < 0) g_str_stm_sel = 0;
+        } else if (total > 0 && (pressed & PS5_PAD_BUTTON_CROSS)) {
+            if (g_str_stm_sel < g_str_stream_count) {
+                pp_str_stream s;
+                pthread_mutex_lock(&g_str_mtx);
+                memcpy(&s, &g_str_streams[g_str_stm_sel], sizeof(s));
+                pthread_mutex_unlock(&g_str_mtx);
+                if (s.playable && s.url[0]) {
+                    prospero_network_play(s.url, g_str_cur.name);
+                } else {
+                    toast("STREAM",
+                          "TORRENT SOURCES ARE NOT SUPPORTED YET");
+                }
+            }
+        } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+            screen = SCREEN_STREAMING_DETAIL;
         }
         return;
     }
@@ -18554,35 +21803,7 @@ static void prospero_net_handle_input(uint32_t pressed) {
             g_osk_ime_pending = 1;
             return;
         }
-        if (pressed & PS5_PAD_BUTTON_DOWN) {
-            g_osk_row++;
-            if (g_osk_row > OSK_CHAR_ROW_COUNT) g_osk_row = 0;
-            int len = osk_row_len(g_osk_row);
-            if (g_osk_col >= len) g_osk_col = len - 1;
-        } else if (pressed & PS5_PAD_BUTTON_UP) {
-            g_osk_row--;
-            if (g_osk_row < 0) g_osk_row = OSK_CHAR_ROW_COUNT;
-            int len = osk_row_len(g_osk_row);
-            if (g_osk_col >= len) g_osk_col = len - 1;
-        } else if (pressed & PS5_PAD_BUTTON_RIGHT) {
-            int len = osk_row_len(g_osk_row);
-            g_osk_col = (g_osk_col + 1) % len;
-        } else if (pressed & PS5_PAD_BUTTON_LEFT) {
-            int len = osk_row_len(g_osk_row);
-            g_osk_col = (g_osk_col + len - 1) % len;
-        } else if (pressed & PS5_PAD_BUTTON_CROSS) {
-            if (g_osk_row < OSK_CHAR_ROW_COUNT) {
-                osk_type_char(OSK_CHAR_ROWS[g_osk_row][g_osk_col]);
-            } else {
-                osk_activate_key(g_osk_col);
-            }
-        } else if (pressed & PS5_PAD_BUTTON_TRIANGLE) {
-            osk_backspace();
-        } else if (pressed & PS5_PAD_BUTTON_SQUARE) {
-            osk_type_char(' ');
-        } else if (pressed & PS5_PAD_BUTTON_OPTIONS) {
-            osk_activate_key(3); /* PLAY */
-        } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+        if (pressed & PS5_PAD_BUTTON_CIRCLE) {
             screen = SCREEN_IPTV;
         }
         return;
@@ -18659,10 +21880,10 @@ static void draw_prospero_toast(
                 alpha * 225 / 255
             )
             : RR_BGRA(
-                0,
-                205,
+                80,
+                140,
                 255,
-                alpha * 205 / 255
+                alpha * 215 / 255
             );
 
     uint32_t glow =
@@ -18674,10 +21895,10 @@ static void draw_prospero_toast(
                 alpha * 55 / 255
             )
             : RR_BGRA(
-                0,
-                135,
+                60,
+                110,
                 255,
-                alpha * 55 / 255
+                alpha * 60 / 255
             );
 
     ui_round_asset(
@@ -18688,10 +21909,10 @@ static void draw_prospero_toast(
         panel_h,
         24,
         RR_BGRA(
-            1,
-            9,
-            22,
-            alpha * 230 / 255
+            0,
+            0,
+            0,
+            alpha * 238 / 255
         ),
         border,
         glow
@@ -18719,10 +21940,10 @@ static void draw_prospero_toast(
                 alpha * 240 / 255
             )
             : RR_BGRA(
-                225,
-                245,
                 255,
-                alpha * 240 / 255
+                255,
+                255,
+                alpha * 245 / 255
             ),
         1
     );
@@ -18749,10 +21970,10 @@ static void draw_prospero_toast(
         panel_y + 72,
         message,
         RR_BGRA(
-            135,
-            200,
-            228,
-            alpha * 220 / 255
+            215,
+            215,
+            215,
+            alpha * 225 / 255
         ),
         0
     );
@@ -18775,12 +21996,15 @@ static int prospero_scrub_active = 0;
 static int prospero_scrub_was_paused = 0;
 
 /*
- * PS Play 1.5: playback settings dialog (OPTIONS in player).
+ * PS Play 2.0: playback settings dialog (OPTIONS in player).
  * All secondary playback actions live here so the pad stays safe:
  * subtitles, audio track, view mode, info and stats.
  */
 static int g_player_menu_open = 0;
 static int g_player_menu_sel = 0;
+
+/* Exit confirmation modal (CIRCLE on the main menu). */
+static int g_exit_confirm = 0;
 
 #define PP_PMENU_ITEM_COUNT 7
 
@@ -18808,11 +22032,162 @@ static double prospero_player_position(void) {
 }
 
 /*
- * Playback settings dialog (PS Play 1.5).
+ * Playback settings dialog (PS Play 2.0).
  * One rounded panel with every secondary option that used to be
  * scattered across TRIANGLE / SQUARE / L1-R1 / L2-R3 / L3 / R2.
  * Drawn over the video; the pad is safe while it is open.
  */
+/*
+ * Volume OSD: small AMOLED panel with a speaker icon and a level bar,
+ * bottom-right above the control hints. Shown alone for ~2 s after
+ * L1/R1 — the progress bar stays hidden.
+ */
+/*
+ * YouTube-style buffering spinner shown while the post-seek resync
+ * state waits for the first frame at the new position. Twelve dots
+ * on a ring with a rotating brightness head; last frame stays
+ * visible underneath.
+ */
+static void draw_seek_spinner(uint32_t *fb) {
+    static const int dx[12] = { 0, 23, 40, 46, 40, 23, 0, -23, -40, -46, -40, -23 };
+    static const int dy[12] = { -46, -40, -23, 0, 23, 40, 46, 40, 23, 0, -23, -40 };
+    int cx = 960, cy = 500;
+    int t = (int)(now_ms() / 70);
+
+    /* soft dark backdrop so the spinner reads over any scene */
+    rr_fill_round(fb, cx - 110, cy - 110, 220, 220, 28, RR_BGRA(0,0,0,150));
+
+    for (int i = 0; i < 12; i++) {
+        int phase = (i - t) % 12;
+        if (phase < 0) phase += 12;
+        int alpha = 245 - phase * 18;
+        if (alpha < 55) alpha = 55;
+        int sz = (phase == 0) ? 18 : 13;
+        rr_fill(fb, cx + dx[i] - sz / 2, cy + dy[i] - sz / 2, sz, sz,
+                RR_BGRA(255,255,255,alpha));
+    }
+
+    rr_text_center(fb, cx, cy + 78, "LOADING", RR_BGRA(203,203,203,220), 1);
+}
+
+
+static void draw_volume_osd(uint32_t *fb) {
+    if (!g_volume_osd_ms || screen != SCREEN_PLAYER) return;
+
+    long long elapsed = now_ms() - g_volume_osd_ms;
+    if (elapsed > 2000) return;
+
+    int alpha = 255;
+    if (elapsed > 1600) {
+        alpha = 255 - (int)((elapsed - 1600) * 255 / 400);
+        if (alpha < 0) alpha = 0;
+    }
+
+    int vol = g_volume_percent;
+
+    const int pw = 430;
+    const int ph = 78;
+    const int px = 1920 - pw - 60;
+    const int py = 1080 - ph - 130;
+
+    /* rounded blue frame + AMOLED black body */
+    rr_fill_round(fb, px - 2, py - 2, pw + 4, ph + 4, 20,
+                  RR_BGRA(90, 150, 255, alpha * 210 / 255));
+    rr_fill_round(fb, px, py, pw, ph, 18,
+                  RR_BGRA(0, 0, 0, alpha * 238 / 255));
+
+    /* speaker icon (white): body + cone + sound waves */
+    int sx = px + 26;
+    int sy = py + 20;
+    uint32_t white = RR_BGRA(255, 255, 255, alpha * 240 / 255);
+    uint32_t dim   = RR_BGRA(255, 255, 255, alpha * 90 / 255);
+    rr_fill(fb, sx,      sy + 13, 10, 14, white);
+    rr_fill(fb, sx + 10, sy + 8,  7,  24, white);
+    rr_fill(fb, sx + 17, sy + 3,  7,  34, white);
+    /* waves light up with the level (and disappear at 0) */
+    rr_fill(fb, sx + 31, sy + 10, 4, 20, vol > 0   ? white : dim);
+    rr_fill(fb, sx + 40, sy + 5,  4, 30, vol > 100 ? white : dim);
+
+    /* level bar */
+    int bx = px + 92;
+    int bw = pw - 92 - 84;
+    int by = py + ph / 2 - 5;
+    rr_fill_round(fb, bx, by, bw, 10, 5,
+                  RR_BGRA(70, 70, 70, alpha * 200 / 255));
+    int fill = bw * vol / 350;
+    if (fill > 0)
+        rr_fill_round(fb, bx, by, fill, 10, 5,
+                      RR_BGRA(90, 150, 255, alpha * 245 / 255));
+
+    /* percentage */
+    char pct[16];
+    snprintf(pct, sizeof(pct), "%d%%", vol);
+    rr_text(fb, px + pw - 72, py + ph / 2 - 12, pct,
+            RR_BGRA(255, 255, 255, alpha * 240 / 255), 0);
+}
+
+/*
+ * Exit confirmation dialog: AMOLED black panel, rounded blue frame,
+ * white text — X confirms, O cancels.
+ */
+static int g_player_exit_confirm = 0;
+
+static void draw_player_exit_confirm(uint32_t *fb) {
+    rr_fill(fb, 0, 0, 1920, 1080, RR_BGRA(0, 0, 0, 150));
+
+    int pw = 760;
+    int ph = 320;
+    int px = (1920 - pw) / 2;
+    int py = (1080 - ph) / 2;
+
+    rr_fill_round(fb, px - 6, py - 6, pw + 12, ph + 12, 26,
+                  RR_BGRA(70, 130, 255, 70));
+    rr_fill_round(fb, px - 2, py - 2, pw + 4, ph + 4, 22,
+                  RR_BGRA(90, 150, 255, 220));
+    rr_fill_round(fb, px, py, pw, ph, 20, RR_BGRA(0, 0, 0, 246));
+
+    rr_text_center(fb, 960, py + 52, "EXIT PLAYBACK?",
+                   RR_BGRA(255, 255, 255, 245), 2);
+    rr_text_center(fb, 960, py + 128, "BACK TO THE PREVIOUS PAGE",
+                   RR_BGRA(180, 180, 180, 220), 1);
+
+    rr_control(fb, px + 170, py + 208, 0); /* X glyph */
+    rr_text(fb, px + 226, py + 224, "CONFIRM",
+            RR_BGRA(255, 255, 255, 240), 1);
+
+    rr_control(fb, px + 450, py + 208, 4); /* O glyph */
+    rr_text(fb, px + 506, py + 224, "CONTINUE",
+            RR_BGRA(255, 255, 255, 240), 1);
+}
+
+static void draw_exit_confirm(uint32_t *fb) {
+    rr_fill(fb, 0, 0, 1920, 1080, RR_BGRA(0, 0, 0, 150));
+
+    int pw = 760;
+    int ph = 320;
+    int px = (1920 - pw) / 2;
+    int py = (1080 - ph) / 2;
+
+    rr_fill_round(fb, px - 6, py - 6, pw + 12, ph + 12, 26,
+                  RR_BGRA(70, 130, 255, 70));
+    rr_fill_round(fb, px - 2, py - 2, pw + 4, ph + 4, 22,
+                  RR_BGRA(90, 150, 255, 220));
+    rr_fill_round(fb, px, py, pw, ph, 20, RR_BGRA(0, 0, 0, 246));
+
+    rr_text_center(fb, 960, py + 52, "EXIT PS PLAY?",
+                   RR_BGRA(255, 255, 255, 245), 2);
+    rr_text_center(fb, 960, py + 128, "THE APPLICATION WILL CLOSE",
+                   RR_BGRA(180, 180, 180, 220), 1);
+
+    rr_control(fb, px + 170, py + 208, 0); /* X glyph */
+    rr_text(fb, px + 226, py + 224, "CONFIRM",
+            RR_BGRA(255, 255, 255, 240), 1);
+
+    rr_control(fb, px + 450, py + 208, 4); /* O glyph */
+    rr_text(fb, px + 506, py + 224, "CANCEL",
+            RR_BGRA(255, 255, 255, 240), 1);
+}
+
 static void prospero_draw_player_menu(uint32_t *fb) {
     if (screen != SCREEN_PLAYER || !g_player_menu_open) return;
 
@@ -19202,27 +22577,6 @@ static int prospero_scrub_confirm(void) {
 
         return 0;
     }
-
-    char time_text[32];
-    char message[96];
-
-    format_time_mmss(
-        time_text,
-        sizeof(time_text),
-        target
-    );
-
-    snprintf(
-        message,
-        sizeof(message),
-        "Seeking to %s",
-        time_text
-    );
-
-    toast(
-        "SEEK",
-        message
-    );
 
     return 1;
 }
@@ -20083,20 +23437,25 @@ static void draw_playback_finished_screen(
 /* PROSPERO_PLAYBACK_COMPLETE_MODULE_END */
 
 
-/* Early-boot diagnostics: append a line to /data/PSPlay15.log so a
+/* Early-boot diagnostics: append a line to /data/PS Play/PSPlay20.log so a
  * silent startup failure can be located via FTP. Appended, never blocks UI. */
 static void pp_boot_log(const char *step) {
-    FILE *fp = fopen("/data/PSPlay15.log", "a");
-    if (!fp) fp = fopen("/mnt/usb0/PSPlay15.log", "a");
+    static int dir_done = 0;
+    if (!dir_done) { mkdir("/data/PS Play", 0777); dir_done = 1; }
+    FILE *fp = fopen("/data/PS Play/PSPlay20.log", "a");
+    if (!fp) fp = fopen("/mnt/usb0/PSPlay20.log", "a");
     if (fp) {
         fprintf(fp, "[boot] %s\n", step);
         fclose(fp);
     }
 }
 
+
 int main(void) {
+    /* Own identity first: never match the browser-name needles. */
+    syscall(SYS_thr_set_name, -1, "PSPlay");
     pp_boot_log("main() entered");
-    toast("PS Play", "Version 1.5 - DLNA + IPTV + CAST");
+    toast("PS PLAY", "READY");
     pp_boot_log("toast sent");
     recent_load();
     favorites_load();
@@ -20117,8 +23476,7 @@ int main(void) {
 
     if (pad < 0)
         toast("PAD OPEN FAIL", "Could not open controller");
-    else
-        toast("PAD OPEN OK", "Controller connected");
+    /* silent on success: controller connect is not toast-worthy */
 
     PS5_PadData padData;
     uint32_t lastButtons = 0;
@@ -20173,7 +23531,6 @@ int main(void) {
     if (pp_dmr_start("PS Play") == 0) {
         g_dmr_started = 1;
         pp_boot_log("dlna renderer active");
-        toast("DLNA RECEIVER", "Console is castable - find it in BubbleUPnP");
     } else {
         pp_boot_log("dlna renderer start failed");
     }
@@ -20293,19 +23650,77 @@ int main(void) {
             uint32_t pressed = padData.buttons & ~lastButtons;
             uint32_t released = lastButtons & ~padData.buttons;
             prospero_scrub_hold_update(padData.buttons);
+            /*
+             * The left stick drives menus like the d-pad, with
+             * auto-repeat while held (not in the player, where the
+             * d-pad left/right scrub keeps its own behavior).
+             */
+            if (screen != 2)
+                pressed |= pp_stick_nav_update(padData.leftStick.x,
+                                               padData.leftStick.y);
             int prompt_button_handled = 0;
 
-            if (screen >= SCREEN_DLNA_SERVERS && screen <= SCREEN_DMR) {
-                /* DLNA / IPTV / URL-entry screens handle their own input. */
+            /*
+             * Exit confirmation modal swallows all pad input:
+             * X quits through the clean shutdown path, O cancels.
+             */
+            if (g_exit_confirm) {
+                if (pressed & PS5_PAD_BUTTON_CROSS) {
+                    g_exit_confirm = 0;
+                    running = 0;
+                } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+                    g_exit_confirm = 0;
+                }
+                pressed = 0;
+                released = 0;
+            }
+
+            /* Player exit confirmation modal swallows all pad input too. */
+            if (g_player_exit_confirm) {
+                if (pressed & PS5_PAD_BUTTON_CROSS) {
+                    g_player_exit_confirm = 0;
+                    recent_update_current_position();
+                    stop_video_playback();
+                    screen = g_playback_return_screen;
+                } else if (pressed & PS5_PAD_BUTTON_CIRCLE) {
+                    g_player_exit_confirm = 0;
+                }
+                pressed = 0;
+                released = 0;
+            }
+
+            if ((screen >= SCREEN_DLNA_SERVERS && screen <= SCREEN_STREAMING_ADDONS) ||
+                screen == SCREEN_IPTV_CHANNELS) {
+                /* DLNA / IPTV / URL-entry / browser / streaming screens handle their own input. */
                 prospero_net_handle_input(pressed);
             } else {
+
+            /*
+             * Volume: L1/R1 adjust the software volume and show only the
+             * small volume OSD — the press is masked out so the progress
+             * bar / controls overlay does NOT appear.
+             */
+            if (screen == SCREEN_PLAYER && !g_player_menu_open &&
+                (pressed & (PS5_PAD_BUTTON_L1 | PS5_PAD_BUTTON_R1))) {
+                if (pressed & PS5_PAD_BUTTON_R1) {
+                    g_volume_percent += 10;
+                    if (g_volume_percent > 350)
+                        g_volume_percent = 350;
+                } else {
+                    g_volume_percent -= 10;
+                    if (g_volume_percent < 0)
+                        g_volume_percent = 0;
+                }
+                g_volume_osd_ms = now_ms();
+                pressed &= ~(PS5_PAD_BUTTON_L1 | PS5_PAD_BUTTON_R1);
+            }
 
             if (pressed && screen == 2 && !g_player_menu_open) {
                 controls_last_used_ms = now_ms();
             }
 
             /*
-             * Player controls (PS Play 1.5):
+             * Player controls (PS Play 2.0):
              *   X                play/pause
              *   LEFT / RIGHT     scrub through the timeline
              *   OPTIONS          playback settings dialog
@@ -20377,7 +23792,7 @@ int main(void) {
 
             if (pressed & PS5_PAD_BUTTON_DOWN) {
                 if (screen == 0) selected = (selected + 1) % 7;
-                else if (screen == SCREEN_SETTINGS) settings_selected = (settings_selected + 1) % 7;
+                else if (screen == SCREEN_SETTINGS) settings_selected = (settings_selected + 1) % 8;
                 else if (screen == SCREEN_PROFILE_SELECT) profile_selected = (profile_selected + 1) % 4;
                 else if (screen == SCREEN_RECENT_FILES && recent_file_count > 0) recent_selected = (recent_selected + 1) % recent_file_count;
                 else if (screen == SCREEN_FAVORITES && favorite_count > 0) favorite_selected = (favorite_selected + 1) % favorite_count;
@@ -20386,7 +23801,7 @@ int main(void) {
 
             if (pressed & PS5_PAD_BUTTON_UP) {
                 if (screen == 0) selected = (selected + 6) % 7;
-                else if (screen == SCREEN_SETTINGS) settings_selected = (settings_selected + 6) % 7;
+                else if (screen == SCREEN_SETTINGS) settings_selected = (settings_selected + 7) % 8;
                 else if (screen == SCREEN_PROFILE_SELECT) profile_selected = (profile_selected + 3) % 4;
                 else if (screen == SCREEN_RECENT_FILES && recent_file_count > 0) recent_selected = (recent_selected + recent_file_count - 1) % recent_file_count;
                 else if (screen == SCREEN_FAVORITES && favorite_count > 0) favorite_selected = (favorite_selected + favorite_count - 1) % favorite_count;
@@ -20519,17 +23934,17 @@ int main(void) {
                         pp_playback_resume(&g_pp_pb);
 #endif
                     controls_last_used_ms = now_ms();
-                    toast("PLAYBACK", player_paused ? "Paused" : "Playing");
+                    /* silent: pause state is already visible on the OSD */
                 } else if (screen == 1) {
                     enter_selected_usb();
                 } else if (selected == 0) {
-                    screen = SCREEN_DMR;
+                    g_dlna_hub_sel = 0;
+                    screen = SCREEN_DLNA_HUB;
                 } else if (selected == 1) {
-                    prospero_net_enter_dlna();
-                    screen = SCREEN_DLNA_SERVERS;
-                } else if (selected == 2) {
                     prospero_net_enter_iptv();
                     screen = SCREEN_IPTV;
+                } else if (selected == 2) {
+                    prospero_streaming_enter();
                 } else if (selected == 3) {
                     load_usb_files();
                     screen = SCREEN_USB_BROWSER;
@@ -20562,13 +23977,12 @@ int main(void) {
                 } else if (screen == 3) {
                     screen = 1;
                 } else if (screen == 2) {
-                    recent_update_current_position();
-                    stop_video_playback();
-                    screen = 1;
+                    g_player_exit_confirm = 1;
                 } else if (screen == 1) {
                     usb_go_back();
                 } else {
-                    toast("EXIT", "Use PS button to close for now");
+                    /* main menu: ask before quitting */
+                    g_exit_confirm = 1;
                 }
             }
 
@@ -20653,8 +24067,30 @@ int main(void) {
             draw_dlna_browse_screen(linear);
         else if (screen == SCREEN_IPTV)
             draw_iptv_screen(linear);
+        else if (screen == SCREEN_IPTV_M3U)
+            draw_iptv_m3u_screen(linear);
+        else if (screen == SCREEN_IPTV_CHANNELS)
+            draw_iptv_channels_screen(linear);
+        else if (screen == SCREEN_DLNA_HUB)
+            draw_dlna_hub_screen(linear);
+        else if (screen == SCREEN_WEB_BROWSER)
+            draw_web_browser_screen(linear);
+        else if (screen == SCREEN_WEB_MEDIA)
+            draw_web_media_screen(linear);
         else if (screen == SCREEN_URL_ENTRY)
             draw_url_entry_screen(linear);
+        else if (screen == SCREEN_STREAMING_HOME)
+            draw_streaming_home_screen(linear);
+        else if (screen == SCREEN_STREAMING_CATALOG)
+            draw_streaming_catalog_screen(linear);
+        else if (screen == SCREEN_STREAMING_DETAIL)
+            draw_streaming_detail_screen(linear);
+        else if (screen == SCREEN_STREAMING_STREAMS)
+            draw_streaming_streams_screen(linear);
+        else if (screen == SCREEN_STREAMING_SETTINGS)
+            draw_streaming_settings_screen(linear);
+        else if (screen == SCREEN_STREAMING_ADDONS)
+            draw_streaming_addons_screen(linear);
         else if (screen == SCREEN_DMR)
             draw_dmr_screen(linear);
         else if (screen == SCREEN_MEDIA_INFO)
@@ -20675,6 +24111,71 @@ int main(void) {
         /* OPTIONS playback settings dialog over the player frame */
         if (screen == 2)
             prospero_draw_player_menu(linear);
+        /* Volume OSD (L1/R1) — standalone, no progress bar */
+        if (screen == 2 && g_volume_osd_ms)
+            draw_volume_osd(linear);
+        /*
+         * Seek resync safety nets — the spinner must NEVER be forever:
+         *  - while paused, freeze the resync timers;
+         *  - no packets flowing for 6s (stalemate) → release audio;
+         *  - 15s without reaching the target (hung network seek) →
+         *    abort the stuck I/O and bail out to the menu.
+         */
+        if (g_seek_resync && player_paused) {
+            g_seek_resync_since_ms = now_ms();
+            g_seek_resync_progress_ms = g_seek_resync_since_ms;
+        }
+        if (g_seek_resync && !player_paused) {
+            long long nwr = now_ms();
+            if (g_seek_resync_progress_ms &&
+                nwr - g_seek_resync_progress_ms > 6000) {
+                g_seek_resync = 0;
+                pp_boot_log("seek resync released by timeout");
+            } else if (g_seek_resync_since_ms &&
+                       nwr - g_seek_resync_since_ms > 15000) {
+                pp_boot_log("seek hard timeout - aborting playback");
+                stop_video_playback();
+                screen = 0;
+                toast("SEEK", "ERROR - network timeout, playback stopped");
+            }
+        }
+        /*
+         * Streaming buffering detection (not only seeks): if no new
+         * frame has been presented for ~0.9 s while the stream is not
+         * at EOF — slow network, server hiccup, initial open — show
+         * the same spinner. Audio-only files watch the audio blocks.
+         */
+        int pp_buffering = 0;
+        if (screen == SCREEN_PLAYER && !player_paused && !g_seek_resync) {
+            long long nowb = now_ms();
+            if (video_stream_index >= 0) {
+                long long ref = g_last_present_ms
+                    ? g_last_present_ms : g_playback_start_ms;
+                if (ref && nowb - ref > 900 && !video_decode_done)
+                    pp_buffering = 1;
+            } else if (audio_ctx) {
+                static unsigned long s_seq = 0;
+                static long long s_seq_ms = 0;
+                if (g_audio_block_seq != s_seq) {
+                    s_seq = g_audio_block_seq;
+                    s_seq_ms = nowb;
+                }
+                long long ref = s_seq_ms ? s_seq_ms : g_playback_start_ms;
+                if (ref && nowb - ref > 900 && !video_decode_done)
+                    pp_buffering = 1;
+            }
+        }
+        if (screen == SCREEN_PLAYER && !player_paused &&
+            (g_seek_resync || pp_buffering))
+            draw_seek_spinner(linear);
+        /* Exit confirmation modal over everything else */
+        if (g_exit_confirm)
+            draw_exit_confirm(linear);
+        if (g_player_exit_confirm)
+            draw_player_exit_confirm(linear);
+        /* "Watch in PS Play?" media prompt */
+        if (g_media_prompt)
+            draw_media_prompt(linear);
         /* Toasts only when UI allowed (or menus); stage 1-3 video-only skips toast draw */
         if (!(screen == 2 && g_4k_diag_active && g_4k_suppress_ui))
             draw_prospero_toast(linear);

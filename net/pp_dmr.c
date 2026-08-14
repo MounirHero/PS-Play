@@ -73,6 +73,17 @@ static volatile int g_cmd_pending = 0;
 
 static pp_dmr_sub g_subs[PP_DMR_MAX_SUBS];
 
+/*
+ * Device-connect detection: remember the controller IPs that have
+ * subscribed to GENA events; the first subscription from a new IP
+ * raises a one-shot event that the UI turns into a notification.
+ */
+#define PP_DMR_MAX_SEEN 16
+static char g_seen_ips[PP_DMR_MAX_SEEN][64];
+static int g_seen_count = 0;
+static char g_dev_event_ip[64] = {0};
+static volatile int g_dev_event_pending = 0;
+
 static pthread_t g_ssdp_tid;
 static pthread_t g_http_tid;
 static int g_http_listen = -1;
@@ -688,6 +699,19 @@ int pp_dmr_take_command(pp_dmr_cmd *out) {
     return 1;
 }
 
+int pp_dmr_take_device_event(char *out, size_t outsz) {
+    if (!out || outsz == 0) return 0;
+    pthread_mutex_lock(&g_mtx);
+    if (!g_dev_event_pending) {
+        pthread_mutex_unlock(&g_mtx);
+        return 0;
+    }
+    snprintf(out, outsz, "%s", g_dev_event_ip);
+    g_dev_event_pending = 0;
+    pthread_mutex_unlock(&g_mtx);
+    return 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* SOAP action handlers                                                */
 /* ------------------------------------------------------------------ */
@@ -1080,6 +1104,33 @@ static void handle_subscribe(int fd, const char *head, int service, int unsubscr
     if (cl >= 2 && cb[cl - 1] == '>') {
         memmove(cb, cb + 1, cl - 2);
         cb[cl - 2] = 0;
+    }
+
+    /* first subscription from a controller IP -> device-connect event */
+    {
+        char ip[64] = {0};
+        const char *p = strstr(cb, "://");
+        p = p ? p + 3 : cb;
+        size_t i = 0;
+        while (p[i] && p[i] != ':' && p[i] != '/' && i < sizeof(ip) - 1) {
+            ip[i] = p[i];
+            i++;
+        }
+        ip[i] = 0;
+        if (ip[0]) {
+            pthread_mutex_lock(&g_mtx);
+            int known = 0;
+            for (int k = 0; k < g_seen_count; k++)
+                if (!strcmp(g_seen_ips[k], ip)) { known = 1; break; }
+            if (!known) {
+                if (g_seen_count < PP_DMR_MAX_SEEN)
+                    snprintf(g_seen_ips[g_seen_count++],
+                             sizeof(g_seen_ips[0]), "%s", ip);
+                snprintf(g_dev_event_ip, sizeof(g_dev_event_ip), "%s", ip);
+                g_dev_event_pending = 1;
+            }
+            pthread_mutex_unlock(&g_mtx);
+        }
     }
 
     pp_dmr_sub sub;

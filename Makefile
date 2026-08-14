@@ -15,6 +15,7 @@ STAGE ?= 4
 
 CFLAGS := -Wall -g -O2 \
     -Ipp/include \
+    -Icjson \
     -I$(PS5_PAYLOAD_SDK)/target/user/homebrew/include/SDL2 \
     -I$(PS5_PAYLOAD_SDK)/target/user/homebrew/include \
     -DPP_4K_PRODUCT_STAGE=$(STAGE)
@@ -52,6 +53,7 @@ PP_SRCS := \
     pp/src/pp_clock.c \
     pp/src/pp_playback.c \
     pp/src/tile_copy.c \
+    cjson/cJSON.c \
     net/pp_http.c \
     net/pp_dlna.c \
     net/pp_iptv.c \

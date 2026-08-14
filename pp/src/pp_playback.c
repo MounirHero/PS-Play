@@ -473,11 +473,12 @@ void pp_playback_notify_seek_begin(pp_playback *pb, int64_t target_pts_us)
     pb->seek_target_us = target_pts_us;
     pb->seek_begin_ms = now_ms();
     pp_clock_pause(&pb->clock);
-    if (pb->lock)
-        pthread_mutex_lock(mtx(pb));
-    pb->display_ready = 0;
-    if (pb->lock)
-        pthread_mutex_unlock(mtx(pb));
+    /*
+     * Keep the last decoded frame on screen while seeking
+     * (display_ready stays set) — no more black flash between
+     * consecutive seeks; the first frame at the new position
+     * replaces it as soon as it is decoded.
+     */
 }
 
 void pp_playback_notify_seek_end(pp_playback *pb, int success,

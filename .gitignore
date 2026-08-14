@@ -1,17 +1,12 @@
 # Build artifacts
 *.elf
 *.o
-*.a
+PS5MediaPlayerPRO.elf
+PSPlay-1.5.elf
+prospero_media_standalone/assets/ProsperoPlayer.elf
 
-# Generated assets / debug output
-assets/gen/
-debug/
+# Logs
+*.log
 
-# OS / editor noise
+# OS junk
 .DS_Store
-*.swp
-.vscode/
-.idea/
-
-# Local toolchain env
-env.sh

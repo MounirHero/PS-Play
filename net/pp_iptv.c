@@ -9,6 +9,7 @@
 #include <strings.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <sys/stat.h>
 
 /* Built-in demo channels (public test streams, HLS). */
 static const struct { const char *name; const char *url; const char *group; }
@@ -102,6 +103,13 @@ int pp_iptv_parse_file(const char *path, const char *source_label,
         if (strncmp(line, "http://", 7) == 0 ||
             strncmp(line, "https://", 8) == 0 ||
             strncmp(line, "rtmp://", 7) == 0 ||
+            strncmp(line, "rtmps://", 8) == 0 ||
+            strncmp(line, "rtmpt://", 8) == 0 ||
+            strncmp(line, "rtsp://", 7) == 0 ||
+            strncmp(line, "rtp://", 6) == 0 ||
+            strncmp(line, "mmsh://", 7) == 0 ||
+            strncmp(line, "mmst://", 7) == 0 ||
+            strncmp(line, "ftp://", 6) == 0 ||
             strncmp(line, "udp://", 6) == 0) {
             pp_iptv_channel *c = &channels[count];
             memset(c, 0, sizeof(*c));
@@ -127,20 +135,27 @@ int pp_iptv_parse_file(const char *path, const char *source_label,
     return count - already_loaded;
 }
 
-static void scan_dir(const char *dir, pp_iptv_channel *channels,
+/* Recursive scan: every subfolder of the given roots is searched. */
+static void scan_dir(const char *dir, int depth, pp_iptv_channel *channels,
                      int max_channels, int *count) {
+    if (depth > 4) return;
     DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d)) != NULL && *count < max_channels) {
         if (e->d_name[0] == '.') continue;
-        if (!has_playlist_ext(e->d_name)) continue;
         char path[1024];
         snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-        char label[64];
-        snprintf(label, sizeof(label), "%s", e->d_name);
-        *count += pp_iptv_parse_file(path, label, channels,
-                                     max_channels, *count);
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            scan_dir(path, depth + 1, channels, max_channels, count);
+        } else if (has_playlist_ext(e->d_name)) {
+            char label[64];
+            snprintf(label, sizeof(label), "%s", e->d_name);
+            *count += pp_iptv_parse_file(path, label, channels,
+                                         max_channels, *count);
+        }
     }
     closedir(d);
 }
@@ -148,14 +163,14 @@ static void scan_dir(const char *dir, pp_iptv_channel *channels,
 int pp_iptv_load(pp_iptv_channel *channels, int max_channels) {
     int count = 0;
 
-    /* USB roots and common playlist folders. */
+    /* /data/PS Play plus USB sticks, all subfolders included. */
     static const char *scan_dirs[] = {
-        "/mnt/usb0", "/mnt/usb0/IPTV", "/mnt/usb0/iptv",
-        "/mnt/usb0/PLAYLISTS", "/mnt/usb0/playlists",
-        "/mnt/usb1", "/mnt/usb1/IPTV", "/mnt/usb1/iptv",
+        "/data/PS Play",
+        "/mnt/usb0",
+        "/mnt/usb1",
     };
     for (size_t i = 0; i < sizeof(scan_dirs) / sizeof(scan_dirs[0]); i++) {
-        scan_dir(scan_dirs[i], channels, max_channels, &count);
+        scan_dir(scan_dirs[i], 0, channels, max_channels, &count);
     }
 
     /* Built-in demo channels */

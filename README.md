@@ -1,70 +1,85 @@
-# PS Play 1.5
+# PS Play
 
-**All-in-one media hub for jailbroken PlayStation 5** — DLNA receiver (cast target), DLNA/UPnP browser, IPTV/Live TV and USB playback in a single native app with a minimal AMOLED-black UI.
+**All-in-one media hub for jailbroken PlayStation 5** — DLNA receiver, DLNA/UPnP browser, native Stremio client, IPTV/Live TV and USB playback in a single native app with a minimal AMOLED-black UI.
 
-PS Play is based on the open-source **[Prospero Player 1.0](https://github.com/KINGDKAK/ProsperoPlayer)** project by **KINGDKAK**, rebuilt and expanded with a new interface, a UPnP MediaRenderer, native system keyboard support and heavy network-streaming optimizations.
-
-> **Credits:** InsideMatrixDev / MounirHero — based on [Prospero Player 1.0](https://github.com/KINGDKAK/ProsperoPlayer) by KINGDKAK (GPL-3.0)
+> **Credits:** InsideMatrixDev / MounirHero  
+> Based on [Prospero Player 1.0](https://github.com/KINGDKAK/ProsperoPlayer) by KINGDKAK (GPL-3.0)  
+> Stremio integration ported from **Stremio Portable** by **stuey-81**
 
 ---
 
 ## Features
 
-### Four ways to watch, one app
-- **DLNA Receiver** — turns your PS5 into a Chromecast-like target: full UPnP MediaRenderer:1 with play / pause / stop / seek / volume control, GENA eventing and position reporting. Find "PS Play" in BubbleUPnP or any DLNA controller and cast wirelessly.
-- **DLNA / UPnP Browser** — automatic discovery of media servers on your LAN (NAS, PCs, routers) with full ContentDirectory browsing: folders, videos, music and metadata.
-- **IPTV / Live TV** — reads `.m3u` / `.m3u8` playlists from USB (root, `/IPTV`, `/PLAYLISTS`), custom URL entry (http / HLS / rtmp / udp), built-in public HLS test channels.
-- **USB Browser** — local playback from USB storage, with recent files list and resume playback.
+### Four ways to watch
+- **DLNA Hub** — UPnP MediaRenderer:1 cast target (find "PS Play" in BubbleUPnP or any DLNA controller) plus automatic discovery and browsing of LAN media servers, all in one menu.
+- **IPTV / Live TV** — reads `.m3u` / `.m3u8` from USB (all ports usb0-usb3 in one list) and `/data/PS Play`, custom URL entry, built-in public HLS test channels. Dedicated channel list with TRIANGLE search and SQUARE reload (up to 2500 channels).
+- **Stremio** — native addon client (Nuvio-style), no web engine. Movies & series with disk-cached posters and episode lists. Load addons via `Stremio_addons.txt` on USB or `/data/PS Play`, or enter manifests manually. Catalogs come from catalog-capable addons; streams are aggregated from **all** installed stream addons.
+- **USB & Local** — browse all USB ports in a single list, recent files with resume position and restart prompt.
 
 ### Built for the couch
-- **AMOLED pure-black theme** across the whole interface — zero distractions, designed for TV.
-- **Horizontal tile menu**: DLNA Receiver · DLNA/UPnP · IPTV/Live TV · Browse USB · Recent Files · Settings (with Developer Tools inside) · About.
-- **Transparent playback overlay**: just the video, a single slim progress bar, the title and two hints — no panels, no backgrounds, no icon clutter.
-- **Accidental-press-proof controls**: during playback only X, D-pad LEFT/RIGHT, OPTIONS and CIRCLE are active. Everything else lives inside the OPTIONS dialog.
-- **Native PS5 system keyboard** (sceImeDialog) for all text fields — full symbols, all input languages. Opens automatically; built-in keyboard as fallback.
+- **AMOLED pure-black UI** — horizontal icon-row menu, grayscale palette (black / gray / white), selected tile grows with a bright white outline.
+- **Native PS5 system keyboard** — sceImeDialog for every text field; full symbols and all languages. Auto-reopens on invalid input; OPTIONS reopens manually.
+- **Left analog stick navigation** — works like the d-pad with continuous auto-scroll when held.
+- **Clean notifications** — only essential toasts ("PS Play READY", "CASTING", errors). Debug spam removed.
+- **Accidental-press-proof** — during playback only X, D-pad LEFT/RIGHT, OPTIONS and CIRCLE are active; everything else lives inside the OPTIONS dialog.
 
-### Serious playback engineering
-- FFmpeg-powered decoding: H.264 / HEVC up to 4K with adaptive multithreaded decoding tuned to the PS5 CPU.
-- **Network streaming optimizations**: 4 MB socket receive buffer, 16 MB short-seek cache (±10 s seeks served from buffered data instead of reopening the HTTP stream), deep 256-packet demux-ahead queues that absorb Wi-Fi jitter, reduced probe window for fast stream startup.
-- **Full subtitle support**: external SRT, embedded tracks, per-track selection, ±100 ms delay nudging.
-- Multiple audio tracks, aspect ratio control (Fit / Fill / Stretch), media info panel, optional stats overlay.
+### Playback engineering
+- **FFmpeg-powered** — H.264, HEVC, AV1, VP9, MPEG-2/4, AAC, AC3, E-AC3, DTS, TrueHD, ALAC, FLAC, Opus, Vorbis, WMA, PCM. Protocols: HTTP/S, HLS, RTSP, RTP, UDP, RTMP, MMSH.
+- **Network anti-freeze** — 8 MB socket buffer, 384-packet demux queues, PTS discontinuity re-anchoring (HLS restarts / source switches), auto-resync on >3s desync, deadlock prevention (stalled audio dropped to keep video flowing), 1.5s post-underrun buffer, auto-reconnect on 4xx/5xx.
+- **Fast seeking** — 16 MB short-seek cache serves ±10s seeks from RAM without reopening the stream. Decoder threads park before touching codec state; the last frame stays visible instead of flashing black.
+- **Subtitles & audio** — external SRT, embedded tracks, per-track selection, ±100ms delay nudging. Multiple audio tracks, aspect ratio (Fit / Fill / Stretch), media info panel, optional stats overlay.
+- **Software volume** — 0-150%, also driven by DLNA SetVolume.
 
-## Requirements
+---
 
-- PlayStation 5 on firmware **4.00** (other umtx-compatible firmwares may work)
-- An active jailbreak (umtx) and a payload sender (port 9021)
-- Like all homebrew on this firmware, **the ELF must be injected again after each reboot**
+## Menu layout (7 entries)
 
-## Installation
+**DLNA · IPTV / LIVE TV · WEB BROWSER · BROWSE USB · RECENT FILES · SETTINGS · ABOUT**
 
-1. Jailbreak your PS5 and start the payload listener.
-2. Inject **`PSPlay-1.5-MediaLauncher.elf`** (the installer).
-3. Watch the notifications: `step 3 ok` → `step 4 ok` → `step 6 ok` → `PS Play 1.5 ready — Open from Media`.
-4. Open **PS Play** from the Media section of the home screen.
+Navigate with **LEFT/RIGHT** or the **left analog stick**. **X** to open, **CIRCLE** back.  
+CIRCLE on the main menu asks for exit confirmation (X quits, O cancels).
 
-> `PSPlay-1.5.elf` is the standalone player (useful for quick tests) — it does **not** install the home-screen tile. Use the MediaLauncher for installation.
+---
 
 ## Controls
 
 | Context | Input | Action |
 |---|---|---|
-| Menus | D-pad | Navigate |
-| Menus | X / CIRCLE | Select / Back |
+| Menu | D-pad / Left stick | Navigate |
+| Menu | X / CIRCLE | Select / Back |
 | Playback | X | Play / Pause |
-| Playback | LEFT / RIGHT | Seek ±10 s (hold to accelerate, X confirms) |
+| Playback | LEFT / RIGHT | Seek ±10s (hold to accelerate, X confirms) |
 | Playback | OPTIONS | Playback settings dialog |
-| Playback | CIRCLE | Stop and go back |
+| Playback | CIRCLE | Stop and return (with "EXIT PLAYBACK?" confirmation) |
 | OPTIONS dialog | UP / DOWN | Navigate rows |
 | OPTIONS dialog | X, LEFT / RIGHT | Activate / adjust value |
-| Text fields | — | PS5 system keyboard (OPTIONS reopens) |
+| Text fields | — | PS5 system keyboard |
 
-The **OPTIONS playback dialog** groups every secondary action: subtitles on/off, subtitle track, subtitle delay, audio track, aspect ratio, media info and statistics.
+**OPTIONS playback dialog:** subtitles on/off, subtitle track, subtitle delay, audio track, software volume, aspect ratio, media info, statistics.
+
+---
+
+## Requirements
+
+- An active jailbreak and a payload sender (port 9021)
+- Like all homebrew on this firmware, **the ELF must be injected again after each reboot**
+
+---
+
+## Installation
+
+1. Jailbreak your PS5 and start the payload listener.
+2. Inject **`PSPlay.elf`** (the installer).
+3. Watch the notifications: `step 3 ok` → `step 4 ok` → `step 6 ok` → `PS Play ready — Open from Media`.
+4. Open **PS Play** from the Media section of the home screen.
+
+> `PSPlay.elf` is the standalone player (useful for quick tests) — it does **not** install the home-screen tile. Use the MediaLauncher for installation.
+
+---
 
 ## Building from source
 
-You need the [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk) with its
-pacbrew packages (SDL2, FFmpeg, OpenSSL, libiconv, zlib, bzip2, xz) and a host
-LLVM/clang toolchain (15+).
+You need the [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk) with its pacbrew packages (SDL2, FFmpeg, OpenSSL, libiconv, zlib, bzip2, xz) and a host LLVM/clang toolchain (15+).
 
 ```sh
 export PS5_PAYLOAD_SDK=/path/to/ps5-payload-sdk
@@ -72,36 +87,27 @@ export PATH=$PS5_PAYLOAD_SDK/bin:$PATH
 
 # 1. Player
 make                        # produces PS5MediaPlayerPRO.elf
-llvm-strip -o PSPlay-1.5.elf PS5MediaPlayerPRO.elf
+llvm-strip -o PSPlay.elf PS5MediaPlayerPRO.elf
 
 # 2. Media launcher (embeds the player + assets)
-cp PSPlay-1.5.elf prospero_media_standalone/assets/ProsperoPlayer.elf
+cp PSPlay.elf prospero_media_standalone/assets/ProsperoPlayer.elf
 cd prospero_media_standalone
 make SDK=$PS5_PAYLOAD_SDK   # produces ProsperoPlayer_MediaLauncher.elf
 ```
 
-## Project structure
+---
 
-```
-main.c                        player core: UI, playback engine, input, OSD
-pp/                           video output / conversion backend
-net/                          HTTP, DLNA browser, DMR (cast receiver), IPTV
-playback/                     playback profiles
-storage/                      recent files, favorites
-metadata/                     media metadata helpers
-ui/                           about / developer screens
-assets/                       fonts, icons, UI bitmaps
-prospero_media_standalone/    media-tile launcher, installer and assets
-test/                         DMR host-side tests
-docs/                         launcher internals
-```
+## Tidier `/data`
+
+All app data now lives in `/data/PS Play/` (log, resume state, web history, Stremio addons, poster cache) instead of flooding the system `/data` folder. Files from 2.0 are migrated automatically.
+
+---
 
 ## License
 
-GNU General Public License v3.0 (or later) — see [LICENSE](LICENSE).
-Based on **[Prospero Player 1.0](https://github.com/KINGDKAK/ProsperoPlayer)** by KINGDKAK (GPL-3.0) — see [NOTICE](NOTICE).
+GNU General Public License v3.0 (or later) — see [LICENSE](LICENSE).  
+Based on [Prospero Player 1.0](https://github.com/KINGDKAK/ProsperoPlayer) by KINGDKAK (GPL-3.0) — see [NOTICE](NOTICE).
 
 ## Disclaimer
 
-This is unofficial homebrew software, not affiliated with Sony or PlayStation.
-Use at your own risk on a console you own.
+This is unofficial homebrew software, not affiliated with Sony or PlayStation. Use at your own risk on a console you own.
