@@ -4,7 +4,7 @@
 
 > **Credits:** InsideMatrixDev / MounirHero  
 > Based on [Prospero Player 1.0](https://github.com/KINGDKAK/ProsperoPlayer) by KINGDKAK (GPL-3.0)  
-> Stremio integration ported from **Stremio Portable** by **stuey-81**
+> Stremio integration ported from **Nuvio Portable** by **stuey-81**
 
 ---
 
